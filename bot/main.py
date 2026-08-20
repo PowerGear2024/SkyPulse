@@ -14,6 +14,7 @@ import sys
 from bot.config import load_settings
 from bot.database import Database
 from bot.handlers import register_handlers
+from bot.services.emotions import reflect_scheduler
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMService
 from bot.services.presence import OwnerGuard
@@ -119,6 +120,10 @@ async def run_userbot() -> None:
                 pass
             except Exception:
                 logger.exception("Ошибка при остановке proactive")
+        try:
+            await reflect_scheduler.cancel_all()
+        except Exception:
+            logger.exception("Ошибка при остановке reflect tasks")
         try:
             await llm.close()
         except Exception:

@@ -4,8 +4,7 @@
 - Работа только в WORK_HOURS (по умолчанию 8:00–18:00).
 - Если владелец сам пишет с аккаунта — бот молчит, пока тот не выйдет
   (offline / recently) или не истечёт idle-таймаут.
-- Исходящие сообщения бота помечаются через bot_outbound(), чтобы
-  не принять их за ручной диалог владельца.
+- Исходящие бота: bot_outbound() + grace + msg_id, чтобы не принять за ручные.
 """
 
 from __future__ import annotations
@@ -18,6 +17,10 @@ from typing import Iterator
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+_BOT_GRACE_SEC = 4.0
+_BOT_MSG_TTL_SEC = 30.0
+_MAX_BOT_MSGS = 256
 
 
 class OwnerGuard:
@@ -43,11 +46,12 @@ class OwnerGuard:
             raise ValueError("OWNER_IDLE_RESUME_SEC должна быть >= 30")
 
         self._start = dt_time(work_start_hour, 0)
-        # end_hour=18 → до 18:00 (не включая 18:00)
         self._end_hour = work_end_hour
         self._idle_resume_sec = idle_resume_sec
 
         self._bot_depth = 0
+        self._bot_grace_until = 0.0
+        self._bot_msg_ids: dict[tuple[int, int], float] = {}
         self._owner_paused = False
         self._last_manual_mono = 0.0
 
@@ -67,9 +71,40 @@ class OwnerGuard:
             yield
         finally:
             self._bot_depth = max(0, self._bot_depth - 1)
+            # Grace: UpdateNewMessage может прийти после выхода из send_message
+            self._bot_grace_until = time.monotonic() + _BOT_GRACE_SEC
+
+    def note_bot_message(self, chat_id: int, msg_id: int) -> None:
+        now = time.monotonic()
+        self._bot_msg_ids[(int(chat_id), int(msg_id))] = now
+        if len(self._bot_msg_ids) > _MAX_BOT_MSGS:
+            stale = [
+                k
+                for k, ts in self._bot_msg_ids.items()
+                if now - ts > _BOT_MSG_TTL_SEC
+            ]
+            for k in stale:
+                self._bot_msg_ids.pop(k, None)
+            while len(self._bot_msg_ids) > _MAX_BOT_MSGS:
+                oldest = min(self._bot_msg_ids.items(), key=lambda kv: kv[1])[0]
+                self._bot_msg_ids.pop(oldest, None)
+
+    def is_bot_message(self, chat_id: int, msg_id: int | None) -> bool:
+        if msg_id is None:
+            return False
+        key = (int(chat_id), int(msg_id))
+        ts = self._bot_msg_ids.get(key)
+        if ts is None:
+            return False
+        if time.monotonic() - ts > _BOT_MSG_TTL_SEC:
+            self._bot_msg_ids.pop(key, None)
+            return False
+        return True
 
     def is_bot_outbound(self) -> bool:
-        return self._bot_depth > 0
+        if self._bot_depth > 0:
+            return True
+        return time.monotonic() < self._bot_grace_until
 
     def mark_owner_active(self, *, where: str = "") -> None:
         """Владелец сам написал / начал диалог — ставим паузу боту."""
@@ -91,13 +126,11 @@ class OwnerGuard:
 
     def _within_work_hours(self) -> bool:
         now = datetime.now(self._tz)
-        # [start, end) — например 8:00 включительно … 18:00 исключительно
         minutes = now.hour * 60 + now.minute
         start_m = self._start.hour * 60
         end_m = self._end_hour * 60
         if start_m < end_m:
             return start_m <= minutes < end_m
-        # На случай ночного окна (не используем по умолчанию)
         return minutes >= start_m or minutes < end_m
 
     def _refresh_idle(self) -> None:
@@ -108,7 +141,6 @@ class OwnerGuard:
             self.mark_owner_left(reason=f"idle {int(idle)}s")
 
     def block_reason(self) -> str | None:
-        """Почему нельзя отвечать, или None если можно."""
         if not self._within_work_hours():
             return "off_hours"
         self._refresh_idle()

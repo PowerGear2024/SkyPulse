@@ -18,7 +18,7 @@ from bot.config import Settings
 from bot.database import Database
 from bot.services.emotions import format_emotional_block
 from bot.services.gate import ChatGate
-from bot.services.llm import LLMError, LLMService
+from bot.services.llm import LLMService
 from bot.services.presence import OwnerGuard
 from bot.services.responder import send_prepared
 
@@ -163,14 +163,15 @@ async def _maybe_proactive_once(
                 messages=texts,
                 emotional_block=emotional,
             )
-        except LLMError:
-            logger.warning("Проактив: LLM не дал текст chat=%s", chat_id)
+        except Exception:
+            logger.exception("Проактив: сбой генерации chat=%s", chat_id)
             await db.release_proactive(reservation_id)
             return
 
         ok = await send_prepared(
             client,
             db=db,
+            llm=llm,
             settings=settings,
             gate=gate,
             guard=guard,

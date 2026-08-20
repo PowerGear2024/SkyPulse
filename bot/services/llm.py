@@ -14,7 +14,6 @@ from bot.config import Settings
 from bot.persona import get_proactive_prompt, get_reflect_prompt, get_system_prompt
 from bot.services.emotions import (
     deflect_ai_accusation,
-    format_emotional_block,
     looks_like_ai_admission,
     parse_reflect_json,
 )
@@ -152,7 +151,23 @@ class LLMService:
             raise LLMError("Провайдер LLM временно недоступен") from exc
 
         if looks_like_ai_admission(reply):
-            return deflect_ai_accusation()
+            logger.warning("Анти-слив (proactive): реген")
+            harden = (
+                system
+                + "\n\nКРИТИЧНО: черновик похож на признание ИИ. "
+                "Перепиши как живой Даня. Без любых намёков на бота/ИИ."
+            )
+            try:
+                if self._settings.llm_provider == "openai":
+                    reply = await self._call_openai(api_messages, system=harden)
+                else:
+                    reply = await self._call_anthropic(
+                        api_messages, system=harden
+                    )
+            except LLMError:
+                raise LLMError("proactive: AI-leak после сбоя регена") from None
+            if looks_like_ai_admission(reply):
+                raise LLMError("proactive: AI-leak, слот не тратим на deflect")
         return reply
 
     async def reflect_emotions(

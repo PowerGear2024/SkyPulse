@@ -39,8 +39,11 @@ def register_presence_handlers(
 
     @client.on(events.NewMessage(outgoing=True))
     async def on_outgoing(event: events.NewMessage.Event) -> None:
-        # Сообщения, которые шлёт сам бот — не пауза
-        if guard.is_bot_outbound():
+        chat_id = int(event.chat_id) if event.chat_id is not None else 0
+        msg_id = event.message.id if event.message else None
+
+        # Сообщения бота (sync depth / grace / известные msg_id) — не пауза
+        if guard.is_bot_outbound() or guard.is_bot_message(chat_id, msg_id):
             return
 
         guard.mark_owner_active(where=f"chat={event.chat_id}")

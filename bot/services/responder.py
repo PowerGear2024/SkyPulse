@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -13,7 +12,7 @@ from telethon.errors import FloodWaitError, RPCError
 
 from bot.config import Settings
 from bot.database import Database
-from bot.services.emotions import format_emotional_block
+from bot.services.emotions import format_emotional_block, reflect_scheduler
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMError, LLMService
 from bot.services.presence import OwnerGuard
@@ -43,28 +42,23 @@ def _schedule_reflect(
     history: list[dict[str, Any]],
     reply: str,
 ) -> None:
-    async def _run() -> None:
-        try:
-            data = await llm.reflect_emotions(
-                history_tail=history, my_reply=reply
-            )
-            if not data:
-                return
-            await db.save_persona_pulse(
-                chat_id,
-                mood=str(data.get("mood") or "дерзкий"),
-                vibe=str(data.get("vibe") or ""),
-                feelings=list(data.get("feelings") or []),
-            )
-        except Exception:
-            logger.debug(
-                "reflect pulse failed chat_id=%s", chat_id, exc_info=True
-            )
+    epoch = db.pulse_epoch(chat_id)
 
-    try:
-        asyncio.create_task(_run(), name=f"persona-reflect-{chat_id}")
-    except RuntimeError:
-        logger.debug("Нет event loop для reflect chat_id=%s", chat_id)
+    async def _run() -> None:
+        data = await llm.reflect_emotions(
+            history_tail=history, my_reply=reply
+        )
+        if not data:
+            return
+        await db.save_persona_pulse(
+            chat_id,
+            mood=str(data.get("mood") or "дерзкий"),
+            vibe=str(data.get("vibe") or ""),
+            feelings=list(data.get("feelings") or []),
+            expected_epoch=epoch,
+        )
+
+    reflect_scheduler.schedule(chat_id, epoch=epoch, runner=_run)
 
 
 async def generate_and_send(
@@ -85,7 +79,7 @@ async def generate_and_send(
     Сгенерировать ответ по памяти чата (+ optional extra) и отправить.
 
     Память пишется только после успешной отправки:
-    сначала persist_user_notes (если есть), затем ответ бота.
+    notes + reply — одной транзакцией.
     """
     blocked = guard.block_reason()
     if blocked:
@@ -144,27 +138,31 @@ async def generate_and_send(
         if delivered:
             gate.mark_used(chat_id)
             full_reply = "\n".join(delivered)
+            batch: list[dict[str, Any]] = []
+            if persist_user_notes:
+                for note in persist_user_notes:
+                    content = (note.get("content") or "").strip()
+                    if not content:
+                        continue
+                    batch.append(
+                        {
+                            "content": content,
+                            "sender_id": note.get("sender_id"),
+                            "sender_name": note.get("sender_name"),
+                            "is_me": False,
+                        }
+                    )
+            batch.append(
+                {
+                    "content": full_reply,
+                    "sender_id": my_id,
+                    "sender_name": None,
+                    "is_me": True,
+                }
+            )
             try:
-                if persist_user_notes:
-                    for note in persist_user_notes:
-                        content = (note.get("content") or "").strip()
-                        if not content:
-                            continue
-                        await db.add_chat_message(
-                            chat_id,
-                            content,
-                            sender_id=note.get("sender_id"),
-                            sender_name=note.get("sender_name"),
-                            is_me=False,
-                            keep=settings.history_limit,
-                        )
-                await db.add_chat_message(
-                    chat_id,
-                    full_reply,
-                    sender_id=my_id,
-                    sender_name=None,
-                    is_me=True,
-                    keep=settings.history_limit,
+                await db.add_chat_messages_batch(
+                    chat_id, batch, keep=settings.history_limit
                 )
             except Exception:
                 logger.exception(
@@ -206,6 +204,7 @@ async def send_prepared(
     client: TelegramClient,
     *,
     db: Database,
+    llm: LLMService | None = None,
     settings: Settings,
     gate: ChatGate,
     guard: OwnerGuard,
@@ -260,10 +259,11 @@ async def send_prepared(
 
         if delivered:
             gate.mark_used(chat_id)
+            full_reply = "\n".join(delivered)
             try:
                 await db.add_chat_message(
                     chat_id,
-                    "\n".join(delivered),
+                    full_reply,
                     sender_id=my_id,
                     sender_name=None,
                     is_me=True,
@@ -274,6 +274,11 @@ async def send_prepared(
                     "Не удалось сохранить proactive в память chat_id=%s",
                     chat_id,
                 )
+            if llm is not None:
+                history = await db.get_chat_history_for_llm(
+                    chat_id, limit=min(12, settings.history_limit)
+                )
+                _schedule_reflect(llm, db, chat_id, history, full_reply)
         return sent_any
     except Exception:
         logger.exception("Ошибка send_prepared chat_id=%s", chat_id)
@@ -294,7 +299,10 @@ async def _safe_send(
         return False
     try:
         with guard.bot_outbound():
-            await client.send_message(chat_id, text, reply_to=reply_to)
+            msg = await client.send_message(chat_id, text, reply_to=reply_to)
+        msg_id = getattr(msg, "id", None)
+        if msg_id is not None:
+            guard.note_bot_message(chat_id, int(msg_id))
         return True
     except FloodWaitError as exc:
         logger.warning("FloodWait %ss — пропускаю отправку", exc.seconds)

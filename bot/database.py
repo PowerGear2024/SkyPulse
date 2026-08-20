@@ -35,6 +35,8 @@ class Database:
         self._db_path = db_path
         self._connection: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        # Инвалидация in-flight reflect после /reset
+        self._pulse_epoch: dict[int, int] = {}
 
     @property
     def connection(self) -> aiosqlite.Connection:
@@ -305,7 +307,12 @@ class Database:
                     (chat_id,),
                 )
                 await self.connection.commit()
-                logger.info("Память чата очищена chat_id=%s", chat_id)
+                self._pulse_epoch[chat_id] = self._pulse_epoch.get(chat_id, 0) + 1
+                logger.info(
+                    "Память чата очищена chat_id=%s epoch=%s",
+                    chat_id,
+                    self._pulse_epoch[chat_id],
+                )
             except Exception:
                 try:
                     await self.connection.rollback()
@@ -313,6 +320,63 @@ class Database:
                     logger.exception("Не удалось откатить clear_chat_history")
                 logger.exception(
                     "Ошибка clear_chat_history chat_id=%s", chat_id
+                )
+                raise
+
+    def pulse_epoch(self, chat_id: int) -> int:
+        return self._pulse_epoch.get(chat_id, 0)
+
+    async def add_chat_messages_batch(
+        self,
+        chat_id: int,
+        items: list[dict[str, Any]],
+        *,
+        keep: int | None = None,
+    ) -> None:
+        """Атомарно записать несколько сообщений (notes + reply) в одном BEGIN."""
+        if not items:
+            return
+        if keep is not None and keep < 2:
+            raise ValueError("keep должен быть >= 2")
+
+        prepared: list[tuple[Any, ...]] = []
+        for item in items:
+            content = (item.get("content") or "").strip()[:_MAX_CONTENT_LEN]
+            if not content:
+                continue
+            prepared.append(
+                (
+                    chat_id,
+                    item.get("sender_id"),
+                    _clip(item.get("sender_name"), _MAX_SENDER_NAME),
+                    1 if item.get("is_me") else 0,
+                    content,
+                )
+            )
+        if not prepared:
+            return
+
+        async with self._lock:
+            try:
+                await self.connection.execute("BEGIN IMMEDIATE")
+                await self.connection.executemany(
+                    """
+                    INSERT INTO chat_messages
+                        (chat_id, sender_id, sender_name, is_me, content)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    prepared,
+                )
+                if keep is not None:
+                    await self._trim_chat_locked(chat_id, keep)
+                await self.connection.commit()
+            except Exception:
+                try:
+                    await self.connection.rollback()
+                except aiosqlite.Error:
+                    logger.exception("Не удалось откатить add_chat_messages_batch")
+                logger.exception(
+                    "Ошибка add_chat_messages_batch chat_id=%s", chat_id
                 )
                 raise
 
@@ -362,10 +426,45 @@ class Database:
         mood: str,
         vibe: str,
         feelings: list[dict[str, Any]],
-    ) -> None:
+        expected_epoch: int | None = None,
+    ) -> bool:
+        """
+        Сохранить пульс. Если expected_epoch задан и не совпал (после /reset) — no-op.
+        Возвращает True если записали.
+        """
+        if expected_epoch is not None and self.pulse_epoch(chat_id) != expected_epoch:
+            logger.debug(
+                "save_persona_pulse skip chat=%s epoch %s!=%s",
+                chat_id,
+                expected_epoch,
+                self.pulse_epoch(chat_id),
+            )
+            return False
+
+        _valid_stances = frozenset(
+            {"warm", "grudge", "crush", "annoyed", "neutral"}
+        )
         mood = (mood or "дерзкий")[:64]
         vibe = (vibe or "")[:400]
+        # Дедуп по имени (casefold), last wins
+        by_name: dict[str, dict[str, Any]] = {}
+        for f in feelings[:16]:
+            name = str(f.get("name") or "").strip()[:64]
+            if not name:
+                continue
+            stance = str(f.get("stance") or "neutral").strip().lower()[:16]
+            if stance not in _valid_stances:
+                stance = "neutral"
+            by_name[name.casefold()] = {
+                "name": name,
+                "stance": stance,
+                "note": str(f.get("note") or "")[:160],
+            }
+        clean = list(by_name.values())[:8]
+
         async with self._lock:
+            if expected_epoch is not None and self.pulse_epoch(chat_id) != expected_epoch:
+                return False
             try:
                 await self.connection.execute("BEGIN IMMEDIATE")
                 await self.connection.execute(
@@ -383,21 +482,21 @@ class Database:
                     "DELETE FROM persona_feelings WHERE chat_id = ?",
                     (chat_id,),
                 )
-                for f in feelings[:8]:
-                    name = str(f.get("name") or "").strip()[:64]
-                    if not name:
-                        continue
-                    stance = str(f.get("stance") or "neutral")[:16]
-                    note = str(f.get("note") or "")[:160]
+                for f in clean:
                     await self.connection.execute(
                         """
                         INSERT INTO persona_feelings
                             (chat_id, peer_name, stance, note, updated_at)
                         VALUES (?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT(chat_id, peer_name) DO UPDATE SET
+                            stance = excluded.stance,
+                            note = excluded.note,
+                            updated_at = datetime('now')
                         """,
-                        (chat_id, name, stance, note),
+                        (chat_id, f["name"], f["stance"], f["note"]),
                     )
                 await self.connection.commit()
+                return True
             except Exception:
                 try:
                     await self.connection.rollback()
