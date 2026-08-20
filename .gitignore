@@ -1,0 +1,33 @@
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Секреты — никогда не коммитить
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# База данных и логи
+data/
+*.db
+*.sqlite3
+*.log
+logs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~

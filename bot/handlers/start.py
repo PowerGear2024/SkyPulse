@@ -1,0 +1,79 @@
+"""
+Хендлеры команд /start и /reset.
+
+/start — регистрация пользователя в SQLite + приветствие в стиле анонимки.
+/reset — очистка истории диалога (свежий контекст без старых тем).
+"""
+
+from __future__ import annotations
+
+import logging
+
+from aiogram import Router
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message
+
+from bot.database import Database
+
+logger = logging.getLogger(__name__)
+
+router = Router(name="start")
+
+# Приветствие при /start — классический старт в анонимке
+START_TEXT = (
+    "🤖 О, классический старт в анонимке.\n"
+    "\n"
+    "Я твой виртуальный бро, карманный гений и по совместительству лучший "
+    "собеседник, которого ты сегодня встретишь.\n"
+    "\n"
+    "Если коротко: могу на коленке набросать тебе код уровня сеньора-помидора "
+    "(который реально заведется без костылей), решить задачу, от которой у "
+    "твоих преподов или тимлида закипят мозги, или просто цинично поболтать "
+    "за жизнь, пока ты прокрастинируешь. И всё это без унылого морализаторства "
+    "и душноты.\n"
+    "\n"
+    "Короче, я тот самый аноним, который знает всё и даже чуть больше.\n"
+    "\n"
+    "Ну что, с чем пришел? Выкладывай, не стесняйся.."
+)
+
+RESET_TEXT = (
+    "Ок, память протёр — старые темы в утиль. "
+    "Начинаем с чистого листа. Валяй."
+)
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, db: Database) -> None:
+    """Зарегистрировать пользователя и отправить приветствие."""
+    if message.from_user is None:
+        return
+
+    user = message.from_user
+    try:
+        await db.upsert_user(
+            telegram_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+        )
+        await message.answer(START_TEXT)
+    except Exception:
+        logger.exception("Ошибка в /start для user_id=%s", user.id)
+        await message.answer(
+            "Что-то пошло не так на моей стороне. Попробуй /start ещё раз через секунду."
+        )
+
+
+@router.message(Command("reset"))
+async def cmd_reset(message: Message, db: Database) -> None:
+    """Очистить историю диалога пользователя."""
+    if message.from_user is None:
+        return
+
+    try:
+        await db.clear_history(message.from_user.id)
+        await message.answer(RESET_TEXT)
+    except Exception:
+        logger.exception("Ошибка в /reset для user_id=%s", message.from_user.id)
+        await message.answer("Не вышло сбросить историю. Попробуй ещё раз.")
