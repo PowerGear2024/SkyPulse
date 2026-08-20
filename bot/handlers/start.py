@@ -9,17 +9,19 @@ from __future__ import annotations
 
 import logging
 
-from aiogram import Router
+from aiogram import F, Router
+from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
 from bot.database import Database
-from bot.handlers.helpers import ensure_user
+from bot.handlers.helpers import ensure_user, safe_answer
 from bot.persona import RESET_TEXT, START_TEXT
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="start")
+router.message.filter(F.chat.type == ChatType.PRIVATE)
 
 
 @router.message(CommandStart())
@@ -30,12 +32,13 @@ async def cmd_start(message: Message, db: Database) -> None:
 
     try:
         await ensure_user(db, message.from_user)
-        await message.answer(START_TEXT)
+        await safe_answer(message, START_TEXT)
     except Exception:
         logger.exception("Ошибка в /start для user_id=%s", message.from_user.id)
-        await message.answer(
+        await safe_answer(
+            message,
             "Что-то пошло не так на моей стороне. "
-            "Попробуй /start ещё раз через секунду."
+            "Попробуй /start ещё раз через секунду.",
         )
 
 
@@ -47,9 +50,12 @@ async def cmd_reset(message: Message, db: Database) -> None:
 
     try:
         await db.clear_history(message.from_user.id)
-        await message.answer(RESET_TEXT)
+        await safe_answer(message, RESET_TEXT)
     except Exception:
         logger.exception(
             "Ошибка в /reset для user_id=%s", message.from_user.id
         )
-        await message.answer("Не вышло сбросить историю. Попробуй ещё раз.")
+        await safe_answer(
+            message,
+            "Не вышло сбросить историю. Попробуй ещё раз.",
+        )

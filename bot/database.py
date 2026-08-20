@@ -149,11 +149,14 @@ class Database:
         telegram_id: int,
         user_content: str,
         assistant_content: str,
+        *,
+        keep: int | None = None,
     ) -> None:
         """
         Сохранить пару user/assistant в одной транзакции.
 
-        Так история не останется «половинчатой», если вторая запись упадёт.
+        Если передан `keep` — тут же обрезает историю до последних keep
+        сообщений в той же транзакции (не оставляем «хвост» при сбое trim).
         """
         user_content = user_content[:_MAX_CONTENT_LEN]
         assistant_content = assistant_content[:_MAX_CONTENT_LEN]
@@ -173,6 +176,8 @@ class Database:
                 """,
                 (telegram_id, assistant_content),
             )
+            if keep is not None:
+                await self._trim_history_locked(telegram_id, keep)
             await self.connection.commit()
         except Exception:
             try:
@@ -219,6 +224,30 @@ class Database:
             )
             raise
 
+    async def _trim_history_locked(self, telegram_id: int, keep: int) -> int:
+        """Trim внутри уже открытой транзакции (без commit)."""
+        cursor = await self.connection.execute(
+            """
+            DELETE FROM messages
+            WHERE telegram_id = ?
+              AND id < COALESCE(
+                  (
+                      SELECT MIN(id)
+                      FROM (
+                          SELECT id
+                          FROM messages
+                          WHERE telegram_id = ?
+                          ORDER BY id DESC
+                          LIMIT ?
+                      )
+                  ),
+                  0
+              )
+            """,
+            (telegram_id, telegram_id, keep),
+        )
+        return cursor.rowcount if cursor.rowcount is not None else 0
+
     async def trim_history(self, telegram_id: int, keep: int) -> int:
         """
         Удалить старые сообщения, оставив только последние `keep`.
@@ -227,28 +256,8 @@ class Database:
         с секундной точностью при быстрых подряд записях.
         """
         try:
-            cursor = await self.connection.execute(
-                """
-                DELETE FROM messages
-                WHERE telegram_id = ?
-                  AND id < COALESCE(
-                      (
-                          SELECT MIN(id)
-                          FROM (
-                              SELECT id
-                              FROM messages
-                              WHERE telegram_id = ?
-                              ORDER BY id DESC
-                              LIMIT ?
-                          )
-                      ),
-                      0
-                  )
-                """,
-                (telegram_id, telegram_id, keep),
-            )
+            deleted = await self._trim_history_locked(telegram_id, keep)
             await self.connection.commit()
-            deleted = cursor.rowcount if cursor.rowcount is not None else 0
             if deleted:
                 logger.debug(
                     "Обрезана история пользователя %s: удалено %s",

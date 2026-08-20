@@ -18,8 +18,6 @@ from bot.persona import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-# SYSTEM_PROMPT импортируется из bot.persona — единый источник личности.
-
 
 class LLMError(Exception):
     """Ошибка при обращении к провайдеру LLM."""
