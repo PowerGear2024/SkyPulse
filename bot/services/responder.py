@@ -12,11 +12,11 @@ from telethon.errors import FloodWaitError, RPCError
 
 from bot.config import Settings
 from bot.database import Database
-from bot.handlers.helpers import split_message
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMError, LLMService
 from bot.services.presence import OwnerGuard
 from bot.services.typing import generate_with_human_typing, human_pause_typing
+from bot.textutil import split_message
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +32,14 @@ async def generate_and_send(
     chat_id: int,
     my_id: int,
     history_extra: list[dict[str, Any]] | None = None,
+    persist_user_notes: list[dict[str, Any]] | None = None,
     reply_to: int | None = None,
 ) -> bool:
     """
     Сгенерировать ответ по памяти чата (+ optional extra) и отправить.
-    Память is_me пишется только после успешной отправки.
+
+    Память пишется только после успешной отправки:
+    сначала persist_user_notes (если есть), затем ответ бота.
     """
     blocked = guard.block_reason()
     if blocked:
@@ -90,14 +93,34 @@ async def generate_and_send(
 
         if delivered:
             gate.mark_used(chat_id)
-            await db.add_chat_message(
-                chat_id,
-                "\n".join(delivered),
-                sender_id=my_id,
-                sender_name=None,
-                is_me=True,
-                keep=settings.history_limit,
-            )
+            try:
+                if persist_user_notes:
+                    for note in persist_user_notes:
+                        content = (note.get("content") or "").strip()
+                        if not content:
+                            continue
+                        await db.add_chat_message(
+                            chat_id,
+                            content,
+                            sender_id=note.get("sender_id"),
+                            sender_name=note.get("sender_name"),
+                            is_me=False,
+                            keep=settings.history_limit,
+                        )
+                await db.add_chat_message(
+                    chat_id,
+                    "\n".join(delivered),
+                    sender_id=my_id,
+                    sender_name=None,
+                    is_me=True,
+                    keep=settings.history_limit,
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось сохранить ответ в память chat_id=%s "
+                    "(в Telegram уже ушло)",
+                    chat_id,
+                )
 
         return sent_any
 
@@ -114,7 +137,7 @@ async def generate_and_send(
         return False
     except Exception:
         logger.exception("Ошибка ответа в группе chat_id=%s", chat_id)
-        if guard.can_act():
+        if guard.can_act() and not sent_any:
             await _safe_send(
                 client,
                 chat_id,
@@ -185,14 +208,20 @@ async def send_prepared(
 
         if delivered:
             gate.mark_used(chat_id)
-            await db.add_chat_message(
-                chat_id,
-                "\n".join(delivered),
-                sender_id=my_id,
-                sender_name=None,
-                is_me=True,
-                keep=settings.history_limit,
-            )
+            try:
+                await db.add_chat_message(
+                    chat_id,
+                    "\n".join(delivered),
+                    sender_id=my_id,
+                    sender_name=None,
+                    is_me=True,
+                    keep=settings.history_limit,
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось сохранить proactive в память chat_id=%s",
+                    chat_id,
+                )
         return sent_any
     except Exception:
         logger.exception("Ошибка send_prepared chat_id=%s", chat_id)

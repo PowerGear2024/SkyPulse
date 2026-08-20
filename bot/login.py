@@ -44,6 +44,9 @@ async def _login() -> None:
     try:
         await client.start()
         me = await client.get_me()
+        if me is None:
+            logger.error("get_me() вернул None — логин не удался")
+            sys.exit(1)
         logger.info(
             "Успешный вход: %s (id=%s)",
             getattr(me, "username", None) or me.first_name,

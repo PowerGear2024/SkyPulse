@@ -11,6 +11,9 @@ from telethon import TelegramClient, events
 from telethon.tl.types import (
     UpdateUserStatus,
     User,
+    UserStatusEmpty,
+    UserStatusLastMonth,
+    UserStatusLastWeek,
     UserStatusOffline,
     UserStatusOnline,
     UserStatusRecently,
@@ -78,10 +81,18 @@ def register_presence_handlers(
             return
 
         status = update.status
-        if isinstance(status, (UserStatusOffline, UserStatusRecently)):
-            guard.mark_owner_left(
-                reason="offline" if isinstance(status, UserStatusOffline) else "recently"
-            )
+        if isinstance(
+            status,
+            (
+                UserStatusOffline,
+                UserStatusRecently,
+                UserStatusLastWeek,
+                UserStatusLastMonth,
+                UserStatusEmpty,
+            ),
+        ):
+            reason = type(status).__name__.replace("UserStatus", "").lower() or "left"
+            guard.mark_owner_left(reason=reason)
         elif isinstance(status, UserStatusOnline):
             # Только зашёл — ещё не пауза; пауза после первого ручного сообщения.
             logger.debug("Владелец online (пауза только после своего сообщения)")

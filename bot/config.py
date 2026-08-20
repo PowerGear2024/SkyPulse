@@ -57,9 +57,10 @@ class Settings:
         return self.session_dir / self.session_name
 
     def is_chat_allowed(self, chat_id: int) -> bool:
-        if self.allow_all_chats or not self.allowed_chat_ids:
-            return True
-        return chat_id in self.allowed_chat_ids
+        # Если задан whitelist — только он (даже при ALLOW_ALL_CHATS).
+        if self.allowed_chat_ids:
+            return chat_id in self.allowed_chat_ids
+        return self.allow_all_chats
 
     def is_user_allowed(self, user_id: int) -> bool:
         if not self.allowed_user_ids:
@@ -155,6 +156,11 @@ def load_settings(*, require_llm: bool = True) -> Settings:
         raise ValueError(
             "Укажи ALLOWED_CHAT_IDS=-100... или явно ALLOW_ALL_CHATS=true "
             "(иначе user-сессия может отвечать во всех группах)."
+        )
+    if allowed_chat_ids and allow_all_chats:
+        logger.warning(
+            "Заданы и ALLOWED_CHAT_IDS, и ALLOW_ALL_CHATS — "
+            "действует только whitelist ALLOWED_CHAT_IDS"
         )
     if allow_all_chats and not allowed_chat_ids:
         logger.warning(
@@ -314,8 +320,7 @@ def load_settings(*, require_llm: bool = True) -> Settings:
         settings.work_hours_start,
         settings.work_hours_end,
         settings.timezone,
-        "ALL" if settings.allow_all_chats and not settings.allowed_chat_ids
-        else len(settings.allowed_chat_ids),
+        "ALL" if not settings.allowed_chat_ids else len(settings.allowed_chat_ids),
         len(settings.allowed_user_ids) or "ALL",
         settings.history_limit,
     )

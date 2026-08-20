@@ -186,7 +186,4 @@ async def _maybe_proactive_once(
 
 async def _candidate_chats(db: Database, settings: Settings) -> list[int]:
     active = await db.list_active_chat_ids()
-    if settings.allowed_chat_ids:
-        allowed = set(settings.allowed_chat_ids)
-        return [c for c in active if c in allowed]
-    return list(active)
+    return [c for c in active if settings.is_chat_allowed(c)]

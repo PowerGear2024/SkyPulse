@@ -95,7 +95,8 @@ async def run_userbot() -> None:
 
         logger.info(
             "User-сессия как %s (id=%s). Часы %02d–%02d %s; "
-            "пауза пока владелец в TG; mention/реакции/проактив≤%s.",
+            "пауза после ручного сообщения до offline/idle; "
+            "mention/реакции/проактив≤%s.",
             getattr(me, "username", None) or me.first_name,
             me.id,
             settings.work_hours_start,

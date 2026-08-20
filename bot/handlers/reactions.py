@@ -69,7 +69,6 @@ def register_reaction_handlers(
                 settings=settings,
                 gate=gate,
                 guard=guard,
-                me=me,
                 my_id=my_id,
                 seen=seen,
                 inflight=inflight,
@@ -87,7 +86,6 @@ async def _handle_reaction_update(
     settings: Settings,
     gate: ChatGate,
     guard: OwnerGuard,
-    me: User,
     my_id: int,
     seen: dict[tuple[int, int, int], float],
     inflight: set[tuple[int, int, int]],
@@ -188,24 +186,12 @@ async def _handle_reaction_update(
         snippet = "(без текста)"
 
     reaction_line = (
-        f"*поставил(а) реакцию {emoji} на моё сообщение «{snippet}»*"
+        f"*поставил(а) реакцию {emoji} на моё сообщение «{snippet}» "
+        f"— ответь коротко и по-человечески*"
     )
 
     inflight.add(key)
     try:
-        # Фиксируем факт реакции в памяти чата
-        try:
-            await db.add_chat_message(
-                chat_id,
-                reaction_line,
-                sender_id=reactor_id,
-                sender_name=name,
-                is_me=False,
-                keep=settings.history_limit,
-            )
-        except Exception:
-            logger.exception("Не удалось сохранить реакцию в память")
-
         logger.info(
             "Реакция %s от %s на msg=%s в chat=%s",
             emoji,
@@ -223,6 +209,16 @@ async def _handle_reaction_update(
             guard=guard,
             chat_id=chat_id,
             my_id=my_id,
+            history_extra=[
+                {"role": "user", "content": f"[{name}]: {reaction_line}"}
+            ],
+            persist_user_notes=[
+                {
+                    "sender_id": reactor_id,
+                    "sender_name": name,
+                    "content": reaction_line,
+                }
+            ],
             reply_to=msg_id,
         )
         if ok:
