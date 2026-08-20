@@ -14,8 +14,6 @@ from telethon.sessions import StringSession
 
 from bot.config import Settings
 
-logger = logging.getLogger(__name__)
-
 
 def setup_logging(level: str) -> None:
     """Корневой логгер + приглушение шумных библиотек."""

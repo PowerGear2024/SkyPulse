@@ -32,6 +32,16 @@ from bot.services.typing import generate_with_human_typing, human_pause_typing
 logger = logging.getLogger(__name__)
 
 
+def _is_command(text: str, name: str) -> bool:
+    """
+    Точная команда: /name, /name@bot, /name args.
+    Не срабатывает на /nameSomething.
+    """
+    first = text.split(None, 1)[0].lower()
+    base = first.split("@", 1)[0]
+    return base == f"/{name}"
+
+
 def register_handlers(
     client: TelegramClient,
     *,
@@ -45,11 +55,7 @@ def register_handlers(
 
     @client.on(events.NewMessage(incoming=True))
     async def on_incoming(event: events.NewMessage.Event) -> None:
-        # --- ЛС: полный игнор ---
-        if event.is_private:
-            return
-
-        # Только группы / супергруппы (broadcast-каналы — нет)
+        # Только группы / супергруппы. ЛС и каналы-вещалки — полный игнор.
         if not event.is_group:
             return
 
@@ -77,14 +83,13 @@ def register_handlers(
 
         await ensure_user_from_sender(db, sender)
         name = display_name(sender)
-        lowered = text.lower()
 
         # Команды — НЕ засоряем память чата
-        if lowered.startswith("/start"):
+        if _is_command(text, "start"):
             if settings.is_user_allowed(int(sender.id)):
                 await safe_reply(event, get_start_text())
             return
-        if lowered.startswith("/reset"):
+        if _is_command(text, "reset"):
             if settings.is_user_allowed(int(sender.id)):
                 await _cmd_reset(event, db, chat_id)
             return

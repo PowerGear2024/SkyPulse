@@ -152,6 +152,8 @@ class Database:
         content = (content or "").strip()[:_MAX_CONTENT_LEN]
         if not content:
             raise ValueError("add_chat_message: пустой content")
+        if keep is not None and keep < 2:
+            raise ValueError("keep должен быть >= 2")
         sender_name = _clip(sender_name, _MAX_SENDER_NAME)
 
         try:
@@ -171,8 +173,6 @@ class Database:
                 ),
             )
             if keep is not None:
-                if keep < 2:
-                    raise ValueError("keep должен быть >= 2")
                 await self._trim_chat_locked(chat_id, keep)
             await self.connection.commit()
         except Exception:
