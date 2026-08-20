@@ -1,7 +1,7 @@
 """
 Только ГРУППЫ / супергруппы. Личные сообщения — полный игнор.
 
-- Пишет в память ВСЕ тексты чата (видеть смысл и логику).
+- Пишет в память все тексты чата (кроме служебных команд).
 - Отвечает по GROUP_REPLY_MODE (all | mention).
 - Печатает как человек: typing в шапке + задержка от длины ответа.
 """
@@ -27,7 +27,7 @@ from bot.handlers.helpers import (
 from bot.persona import RESET_TEXT, get_start_text
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMError, LLMService
-from bot.services.typing import generate_with_human_typing
+from bot.services.typing import generate_with_human_typing, human_pause_typing
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,6 @@ def register_handlers(
         if sender is None:
             return
 
-        # Свою же учётку на всякий (incoming обычно уже без нас)
         if int(sender.id) == int(me.id):
             return
 
@@ -78,8 +77,21 @@ def register_handlers(
 
         await ensure_user_from_sender(db, sender)
         name = display_name(sender)
+        lowered = text.lower()
 
-        # Память: ВСЕ сообщения чата, даже если не отвечаем
+        # Команды — НЕ засоряем память чата
+        if lowered.startswith("/start"):
+            if settings.is_user_allowed(int(sender.id)):
+                await safe_reply(event, get_start_text())
+            return
+        if lowered.startswith("/reset"):
+            if settings.is_user_allowed(int(sender.id)):
+                await _cmd_reset(event, db, chat_id)
+            return
+        if text.startswith("/"):
+            return
+
+        # Память: все обычные тексты (даже если не отвечаем)
         try:
             await db.add_chat_message(
                 chat_id,
@@ -91,18 +103,6 @@ def register_handlers(
             )
         except Exception:
             logger.exception("Не удалось сохранить сообщение chat_id=%s", chat_id)
-            return
-
-        lowered = text.lower()
-        if lowered.startswith("/start"):
-            if settings.is_user_allowed(int(sender.id)):
-                await safe_reply(event, get_start_text())
-            return
-        if lowered.startswith("/reset"):
-            if settings.is_user_allowed(int(sender.id)):
-                await _cmd_reset(event, db, chat_id)
-            return
-        if text.startswith("/"):
             return
 
         if not settings.is_user_allowed(int(sender.id)):
@@ -120,6 +120,7 @@ def register_handlers(
             settings=settings,
             gate=gate,
             chat_id=chat_id,
+            my_id=int(me.id),
         )
 
 
@@ -162,9 +163,9 @@ async def _reply_in_group(
     settings: Settings,
     gate: ChatGate,
     chat_id: int,
+    my_id: int,
 ) -> None:
     if not gate.try_begin(chat_id):
-        # Уже печатаем в этом чате — молча (по-человечески, без спама «подожди»)
         return
 
     try:
@@ -180,29 +181,26 @@ async def _reply_in_group(
         async def _produce() -> str:
             return await llm.generate_reply(history)
 
-        reply = await generate_with_human_typing(
-            client,
-            chat_id,
-            _produce,
-        )
+        reply = await generate_with_human_typing(client, chat_id, _produce)
 
         await db.add_chat_message(
             chat_id,
             reply,
-            sender_id=None,
+            sender_id=my_id,
             sender_name=None,
             is_me=True,
             keep=settings.history_limit,
         )
 
-        for chunk in split_message(reply):
-            # Между кусками тоже чуть «допечатываем»
+        chunks = split_message(reply)
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                await human_pause_typing(client, chat_id, chunk)
             if not await safe_reply(event, chunk):
                 break
 
     except LLMError:
         logger.warning("Сбой генерации chat_id=%s", chat_id)
-        # Без технических отмазок про «модель»
         await safe_reply(
             event,
             "Блин, мысль оборвалась / инет моргнул. Напиши ещё раз чуть позже.",

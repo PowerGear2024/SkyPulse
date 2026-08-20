@@ -49,6 +49,11 @@ async def run_userbot() -> None:
             return
 
         me = await client.get_me()
+        if me is None:
+            logger.error("get_me() вернул None — сессия битая, перелогинься")
+            exit_code = 1
+            return
+
         register_handlers(
             client,
             db=db,

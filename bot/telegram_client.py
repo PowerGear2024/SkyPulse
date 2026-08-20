@@ -46,8 +46,7 @@ def build_client(settings: Settings) -> TelegramClient:
         session,
         settings.telegram_api_id,
         settings.telegram_api_hash,
-        # Авто-сон при FloodWait до 24ч — иначе Telethon кидает исключение
-        flood_sleep_threshold=24 * 60 * 60,
+        flood_sleep_threshold=60,
         connection_retries=5,
         retry_delay=2,
         auto_reconnect=True,

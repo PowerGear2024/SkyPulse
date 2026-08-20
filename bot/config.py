@@ -70,7 +70,8 @@ def _optional(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip() or default
 
 
-def _parse_id_list(raw: str, field: str) -> frozenset[int]:
+def _parse_chat_ids(raw: str) -> frozenset[int]:
+    """ALLOWED_CHAT_IDS: отрицательные id супергрупп допустимы."""
     if not raw:
         return frozenset()
     ids: set[int] = set()
@@ -82,11 +83,33 @@ def _parse_id_list(raw: str, field: str) -> frozenset[int]:
             value = int(part)
         except ValueError as exc:
             raise ValueError(
-                f"{field}: ожидались целые id через запятую, кусок={part!r}"
+                f"ALLOWED_CHAT_IDS: ожидались целые id, кусок={part!r}"
             ) from exc
-        # chat_id у супергрупп отрицательный — разрешаем любой != 0
         if value == 0:
-            raise ValueError(f"{field}: id не может быть 0")
+            raise ValueError("ALLOWED_CHAT_IDS: id не может быть 0")
+        ids.add(value)
+    return frozenset(ids)
+
+
+def _parse_user_ids(raw: str) -> frozenset[int]:
+    """ALLOWED_USER_IDS: только положительные telegram user id."""
+    if not raw:
+        return frozenset()
+    ids: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError as exc:
+            raise ValueError(
+                f"ALLOWED_USER_IDS: ожидались целые id, кусок={part!r}"
+            ) from exc
+        if value <= 0:
+            raise ValueError(
+                f"ALLOWED_USER_IDS: user id должен быть > 0, получено {value}"
+            )
         ids.add(value)
     return frozenset(ids)
 
@@ -110,12 +133,8 @@ def load_settings() -> Settings:
         )
 
     session_string = _optional("TELEGRAM_SESSION_STRING")
-    allowed_chat_ids = _parse_id_list(
-        _optional("ALLOWED_CHAT_IDS"), "ALLOWED_CHAT_IDS"
-    )
-    allowed_user_ids = _parse_id_list(
-        _optional("ALLOWED_USER_IDS"), "ALLOWED_USER_IDS"
-    )
+    allowed_chat_ids = _parse_chat_ids(_optional("ALLOWED_CHAT_IDS"))
+    allowed_user_ids = _parse_user_ids(_optional("ALLOWED_USER_IDS"))
 
     group_reply_mode = _optional("GROUP_REPLY_MODE", "all").lower()
     if group_reply_mode not in {"all", "mention"}:
