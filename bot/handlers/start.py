@@ -14,12 +14,12 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
 from bot.database import Database
+from bot.handlers.helpers import ensure_user
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="start")
 
-# Приветствие при /start — классический старт в анонимке
 START_TEXT = (
     "🤖 О, классический старт в анонимке.\n"
     "\n"
@@ -49,19 +49,14 @@ async def cmd_start(message: Message, db: Database) -> None:
     if message.from_user is None:
         return
 
-    user = message.from_user
     try:
-        await db.upsert_user(
-            telegram_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
-        )
+        await ensure_user(db, message.from_user)
         await message.answer(START_TEXT)
     except Exception:
-        logger.exception("Ошибка в /start для user_id=%s", user.id)
+        logger.exception("Ошибка в /start для user_id=%s", message.from_user.id)
         await message.answer(
-            "Что-то пошло не так на моей стороне. Попробуй /start ещё раз через секунду."
+            "Что-то пошло не так на моей стороне. "
+            "Попробуй /start ещё раз через секунду."
         )
 
 
@@ -75,5 +70,7 @@ async def cmd_reset(message: Message, db: Database) -> None:
         await db.clear_history(message.from_user.id)
         await message.answer(RESET_TEXT)
     except Exception:
-        logger.exception("Ошибка в /reset для user_id=%s", message.from_user.id)
+        logger.exception(
+            "Ошибка в /reset для user_id=%s", message.from_user.id
+        )
         await message.answer("Не вышло сбросить историю. Попробуй ещё раз.")

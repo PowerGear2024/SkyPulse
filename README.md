@@ -9,15 +9,18 @@
 .
 ├── bot/
 │   ├── __init__.py
+│   ├── __main__.py          # python -m bot
 │   ├── main.py              # точка входа, polling, DI
 │   ├── config.py            # загрузка .env
 │   ├── database.py          # SQLite (users + messages)
 │   ├── handlers/
 │   │   ├── __init__.py      # сборка роутеров
+│   │   ├── helpers.py       # общий ensure_user
 │   │   ├── start.py         # /start, /reset
 │   │   └── chat.py          # текстовый диалог с LLM
 │   └── services/
 │       ├── __init__.py
+│       ├── gate.py          # per-user lock + rate-limit
 │       └── llm.py           # OpenAI / Anthropic + системный промпт
 ├── .env.example             # шаблон секретов
 ├── .gitignore
@@ -64,10 +67,11 @@ cp .env.example .env
 ### 4. Запуск
 
 ```bash
-python -m bot.main
+python -m bot
 ```
 
 Бот стартует в long-polling. В Telegram: `/start` → диалог. `/reset` чистит историю.
+Между запросами одного пользователя — короткий rate-limit (~1.5 с), чтобы не жечь API.
 
 ## Команды бота
 
