@@ -101,6 +101,23 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_proactive_posts_day
                 ON proactive_posts (created_at);
+
+            -- Эмоциональный пульс персонажа по чату
+            CREATE TABLE IF NOT EXISTS persona_mood (
+                chat_id     INTEGER PRIMARY KEY,
+                mood        TEXT NOT NULL DEFAULT 'дерзкий дружеский',
+                vibe        TEXT NOT NULL DEFAULT '',
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS persona_feelings (
+                chat_id     INTEGER NOT NULL,
+                peer_name   TEXT NOT NULL,
+                stance      TEXT NOT NULL DEFAULT 'neutral',
+                note        TEXT NOT NULL DEFAULT '',
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (chat_id, peer_name)
+            );
             """
         )
         await self.connection.commit()
@@ -274,15 +291,120 @@ class Database:
     async def clear_chat_history(self, chat_id: int) -> None:
         async with self._lock:
             try:
+                await self.connection.execute("BEGIN IMMEDIATE")
                 await self.connection.execute(
                     "DELETE FROM chat_messages WHERE chat_id = ?",
                     (chat_id,),
                 )
+                await self.connection.execute(
+                    "DELETE FROM persona_mood WHERE chat_id = ?",
+                    (chat_id,),
+                )
+                await self.connection.execute(
+                    "DELETE FROM persona_feelings WHERE chat_id = ?",
+                    (chat_id,),
+                )
                 await self.connection.commit()
                 logger.info("Память чата очищена chat_id=%s", chat_id)
-            except aiosqlite.Error:
+            except Exception:
+                try:
+                    await self.connection.rollback()
+                except aiosqlite.Error:
+                    logger.exception("Не удалось откатить clear_chat_history")
                 logger.exception(
                     "Ошибка clear_chat_history chat_id=%s", chat_id
+                )
+                raise
+
+    async def get_persona_pulse(self, chat_id: int) -> dict[str, Any]:
+        """mood + vibe + feelings для system prompt."""
+        async with self._lock:
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT mood, vibe FROM persona_mood WHERE chat_id = ?
+                    """,
+                    (chat_id,),
+                )
+                row = await cursor.fetchone()
+                cursor = await self.connection.execute(
+                    """
+                    SELECT peer_name, stance, note
+                    FROM persona_feelings
+                    WHERE chat_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT 8
+                    """,
+                    (chat_id,),
+                )
+                feel_rows = await cursor.fetchall()
+            except aiosqlite.Error:
+                logger.exception("Ошибка get_persona_pulse chat_id=%s", chat_id)
+                raise
+
+        return {
+            "mood": (row["mood"] if row else None),
+            "vibe": (row["vibe"] if row else None),
+            "feelings": [
+                {
+                    "name": r["peer_name"],
+                    "stance": r["stance"],
+                    "note": r["note"] or "",
+                }
+                for r in feel_rows
+            ],
+        }
+
+    async def save_persona_pulse(
+        self,
+        chat_id: int,
+        *,
+        mood: str,
+        vibe: str,
+        feelings: list[dict[str, Any]],
+    ) -> None:
+        mood = (mood or "дерзкий")[:64]
+        vibe = (vibe or "")[:400]
+        async with self._lock:
+            try:
+                await self.connection.execute("BEGIN IMMEDIATE")
+                await self.connection.execute(
+                    """
+                    INSERT INTO persona_mood (chat_id, mood, vibe, updated_at)
+                    VALUES (?, ?, ?, datetime('now'))
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        mood = excluded.mood,
+                        vibe = excluded.vibe,
+                        updated_at = datetime('now')
+                    """,
+                    (chat_id, mood, vibe),
+                )
+                await self.connection.execute(
+                    "DELETE FROM persona_feelings WHERE chat_id = ?",
+                    (chat_id,),
+                )
+                for f in feelings[:8]:
+                    name = str(f.get("name") or "").strip()[:64]
+                    if not name:
+                        continue
+                    stance = str(f.get("stance") or "neutral")[:16]
+                    note = str(f.get("note") or "")[:160]
+                    await self.connection.execute(
+                        """
+                        INSERT INTO persona_feelings
+                            (chat_id, peer_name, stance, note, updated_at)
+                        VALUES (?, ?, ?, ?, datetime('now'))
+                        """,
+                        (chat_id, name, stance, note),
+                    )
+                await self.connection.commit()
+            except Exception:
+                try:
+                    await self.connection.rollback()
+                except aiosqlite.Error:
+                    logger.exception("Не удалось откатить save_persona_pulse")
+                logger.exception(
+                    "Ошибка save_persona_pulse chat_id=%s", chat_id
                 )
                 raise
 

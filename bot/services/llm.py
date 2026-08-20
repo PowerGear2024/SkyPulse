@@ -11,7 +11,13 @@ from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
 from bot.config import Settings
-from bot.persona import get_proactive_prompt, get_system_prompt
+from bot.persona import get_proactive_prompt, get_reflect_prompt, get_system_prompt
+from bot.services.emotions import (
+    deflect_ai_accusation,
+    format_emotional_block,
+    looks_like_ai_admission,
+    parse_reflect_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,23 +80,49 @@ class LLMService:
                 max_retries=2,
             )
 
-    async def generate_reply(self, history: list[dict[str, Any]]) -> str:
+    async def generate_reply(
+        self,
+        history: list[dict[str, Any]],
+        *,
+        emotional_block: str = "",
+    ) -> str:
         messages = normalize_chat_history(history)
+        system = get_system_prompt(emotional_block=emotional_block)
         try:
             if self._settings.llm_provider == "openai":
-                return await self._call_openai(messages)
-            return await self._call_anthropic(messages)
+                reply = await self._call_openai(messages, system=system)
+            else:
+                reply = await self._call_anthropic(messages, system=system)
         except LLMError:
             raise
         except Exception as exc:
             logger.exception("Неожиданная ошибка LLM")
             raise LLMError("Провайдер LLM временно недоступен") from exc
 
+        if looks_like_ai_admission(reply):
+            logger.warning("Анти-слив: ответ похож на признание ИИ — реген")
+            harden = (
+                system
+                + "\n\nКРИТИЧНО: прошлый черновик почти спалил, что ты не человек. "
+                "Перепиши ответ как живой Даня. ЗАПРЕЩЕНО любые намёки на ИИ/бота."
+            )
+            try:
+                if self._settings.llm_provider == "openai":
+                    reply = await self._call_openai(messages, system=harden)
+                else:
+                    reply = await self._call_anthropic(messages, system=harden)
+            except LLMError:
+                return deflect_ai_accusation()
+            if looks_like_ai_admission(reply):
+                return deflect_ai_accusation()
+        return reply
+
     async def generate_proactive(
         self,
         *,
         user_name: str,
         messages: list[str],
+        emotional_block: str = "",
     ) -> str:
         """Короткий живой коммент по теме последних смс пользователя."""
         if not messages:
@@ -107,32 +139,77 @@ class LLMService:
             f"Как будто сам вспомнил тему и вкинул мысль. 1–4 предложения."
         )
         api_messages = [{"role": "user", "content": user_prompt}]
+        system = get_proactive_prompt(emotional_block=emotional_block)
         try:
             if self._settings.llm_provider == "openai":
-                return await self._call_openai(
-                    api_messages, system=get_proactive_prompt()
-                )
-            return await self._call_anthropic(
-                api_messages, system=get_proactive_prompt()
-            )
+                reply = await self._call_openai(api_messages, system=system)
+            else:
+                reply = await self._call_anthropic(api_messages, system=system)
         except LLMError:
             raise
         except Exception as exc:
             logger.exception("Неожиданная ошибка LLM (proactive)")
             raise LLMError("Провайдер LLM временно недоступен") from exc
 
+        if looks_like_ai_admission(reply):
+            return deflect_ai_accusation()
+        return reply
+
+    async def reflect_emotions(
+        self,
+        *,
+        history_tail: list[dict[str, Any]],
+        my_reply: str,
+    ) -> dict[str, Any] | None:
+        """Обновить внутренний пульс после реплики (тихо, JSON)."""
+        snippet_parts: list[str] = []
+        for item in history_tail[-8:]:
+            role = item.get("role")
+            content = (item.get("content") or "").strip()[:400]
+            if not content:
+                continue
+            who = "Я" if role == "assistant" else "Чат"
+            snippet_parts.append(f"{who}: {content}")
+        snippet_parts.append(f"Я (только что): {my_reply[:500]}")
+        user_prompt = (
+            "Обнови эмоциональное состояние Дани после этого куска переписки:\n"
+            + "\n".join(snippet_parts)
+        )
+        try:
+            if self._settings.llm_provider == "openai":
+                raw = await self._call_openai(
+                    [{"role": "user", "content": user_prompt}],
+                    system=get_reflect_prompt(),
+                    temperature=0.4,
+                )
+            else:
+                raw = await self._call_anthropic(
+                    [{"role": "user", "content": user_prompt}],
+                    system=get_reflect_prompt(),
+                    temperature=0.4,
+                )
+        except LLMError:
+            logger.debug("reflect_emotions LLM fail", exc_info=True)
+            return None
+        return parse_reflect_json(raw)
+
     async def _call_openai(
         self,
         messages: list[dict[str, str]],
         *,
         system: str | None = None,
+        temperature: float | None = None,
     ) -> str:
         if self._openai is None:
             raise LLMError("OpenAI-клиент не инициализирован")
         try:
             response = await self._openai.chat.completions.create(
                 model=self._settings.openai_model,
-                temperature=self._settings.llm_temperature,
+                temperature=(
+                    self._settings.llm_temperature
+                    if temperature is None
+                    else temperature
+                ),
                 messages=[
                     {"role": "system", "content": system or get_system_prompt()},
                     *messages,
@@ -152,6 +229,7 @@ class LLMService:
         messages: list[dict[str, str]],
         *,
         system: str | None = None,
+        temperature: float | None = None,
     ) -> str:
         if self._anthropic is None:
             raise LLMError("Anthropic-клиент не инициализирован")
@@ -159,7 +237,11 @@ class LLMService:
             response = await self._anthropic.messages.create(
                 model=self._settings.anthropic_model,
                 max_tokens=4096,
-                temperature=self._settings.llm_temperature,
+                temperature=(
+                    self._settings.llm_temperature
+                    if temperature is None
+                    else temperature
+                ),
                 system=system or get_system_prompt(),
                 messages=messages,
             )

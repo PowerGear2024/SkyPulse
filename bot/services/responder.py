@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -12,6 +13,7 @@ from telethon.errors import FloodWaitError, RPCError
 
 from bot.config import Settings
 from bot.database import Database
+from bot.services.emotions import format_emotional_block
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMError, LLMService
 from bot.services.presence import OwnerGuard
@@ -19,6 +21,50 @@ from bot.services.typing import generate_with_human_typing, human_pause_typing
 from bot.textutil import split_message
 
 logger = logging.getLogger(__name__)
+
+
+async def _emotional_block_for_chat(db: Database, chat_id: int) -> str:
+    try:
+        pulse = await db.get_persona_pulse(chat_id)
+    except Exception:
+        logger.exception("Не удалось загрузить пульс chat_id=%s", chat_id)
+        return ""
+    return format_emotional_block(
+        mood=pulse.get("mood"),
+        vibe=pulse.get("vibe"),
+        feelings=list(pulse.get("feelings") or []),
+    )
+
+
+def _schedule_reflect(
+    llm: LLMService,
+    db: Database,
+    chat_id: int,
+    history: list[dict[str, Any]],
+    reply: str,
+) -> None:
+    async def _run() -> None:
+        try:
+            data = await llm.reflect_emotions(
+                history_tail=history, my_reply=reply
+            )
+            if not data:
+                return
+            await db.save_persona_pulse(
+                chat_id,
+                mood=str(data.get("mood") or "дерзкий"),
+                vibe=str(data.get("vibe") or ""),
+                feelings=list(data.get("feelings") or []),
+            )
+        except Exception:
+            logger.debug(
+                "reflect pulse failed chat_id=%s", chat_id, exc_info=True
+            )
+
+    try:
+        asyncio.create_task(_run(), name=f"persona-reflect-{chat_id}")
+    except RuntimeError:
+        logger.debug("Нет event loop для reflect chat_id=%s", chat_id)
 
 
 async def generate_and_send(
@@ -66,8 +112,12 @@ async def generate_and_send(
         if history_extra:
             history = [*history, *history_extra]
 
+        emotional = await _emotional_block_for_chat(db, chat_id)
+
         async def _produce() -> str:
-            return await llm.generate_reply(history)
+            return await llm.generate_reply(
+                history, emotional_block=emotional
+            )
 
         reply = await generate_with_human_typing(client, chat_id, _produce)
 
@@ -93,6 +143,7 @@ async def generate_and_send(
 
         if delivered:
             gate.mark_used(chat_id)
+            full_reply = "\n".join(delivered)
             try:
                 if persist_user_notes:
                     for note in persist_user_notes:
@@ -109,7 +160,7 @@ async def generate_and_send(
                         )
                 await db.add_chat_message(
                     chat_id,
-                    "\n".join(delivered),
+                    full_reply,
                     sender_id=my_id,
                     sender_name=None,
                     is_me=True,
@@ -121,6 +172,7 @@ async def generate_and_send(
                     "(в Telegram уже ушло)",
                     chat_id,
                 )
+            _schedule_reflect(llm, db, chat_id, history, full_reply)
 
         return sent_any
 

@@ -16,6 +16,7 @@ from telethon.tl.types import User
 
 from bot.config import Settings
 from bot.database import Database
+from bot.services.emotions import format_emotional_block
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMError, LLMService
 from bot.services.presence import OwnerGuard
@@ -151,9 +152,16 @@ async def _maybe_proactive_once(
             return
 
         try:
+            pulse = await db.get_persona_pulse(chat_id)
+            emotional = format_emotional_block(
+                mood=pulse.get("mood"),
+                vibe=pulse.get("vibe"),
+                feelings=list(pulse.get("feelings") or []),
+            )
             reply = await llm.generate_proactive(
                 user_name=name,
                 messages=texts,
+                emotional_block=emotional,
             )
         except LLMError:
             logger.warning("Проактив: LLM не дал текст chat=%s", chat_id)
