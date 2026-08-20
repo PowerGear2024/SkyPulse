@@ -1,6 +1,6 @@
 # SkyPulse — Telegram AI-бот (aiogram 3 + SQLite + OpenAI/Anthropic)
 
-Дерзкий ИИ-собеседник для Telegram: сохраняет пользователей в SQLite,
+Дерзкий собеседник для Telegram (роль: живой чел из Одессы): сохраняет пользователей в SQLite,
 держит скользящее окно истории диалога и отвечает через GPT-4o или Claude.
 
 ## Структура проекта
@@ -12,6 +12,7 @@
 │   ├── __main__.py          # python -m bot
 │   ├── main.py              # точка входа, polling, DI
 │   ├── config.py            # загрузка .env
+│   ├── persona.py           # ФИО, город, год рождения, системный промпт
 │   ├── database.py          # SQLite (users + messages)
 │   ├── handlers/
 │   │   ├── __init__.py      # сборка роутеров
@@ -21,7 +22,7 @@
 │   └── services/
 │       ├── __init__.py
 │       ├── gate.py          # per-user lock + rate-limit
-│       └── llm.py           # OpenAI / Anthropic + системный промпт
+│       └── llm.py           # OpenAI / Anthropic
 ├── .env.example             # шаблон секретов
 ├── .gitignore
 ├── requirements.txt
