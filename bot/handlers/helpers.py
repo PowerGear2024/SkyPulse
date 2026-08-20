@@ -1,5 +1,5 @@
 """
-Хелперы для Telethon-хендлеров.
+Хелперы групповых хендлеров Telethon.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ MAX_USER_CHARS = 4000
 
 
 def as_telegram_user(sender: Any) -> User | None:
-    """Вернуть User или None, если отправитель не человек-аккаунт."""
     if sender is None or not isinstance(sender, User):
         return None
     if getattr(sender, "bot", False) or getattr(sender, "deleted", False):
@@ -29,8 +28,17 @@ def as_telegram_user(sender: Any) -> User | None:
     return sender
 
 
+def display_name(user: User) -> str:
+    parts = [user.first_name or "", user.last_name or ""]
+    name = " ".join(p for p in parts if p).strip()
+    if name:
+        return name
+    if user.username:
+        return user.username
+    return f"id{user.id}"
+
+
 async def ensure_user_from_sender(db: Database, sender: User) -> bool:
-    """Записать/обновить собеседника."""
     return await db.upsert_user(
         telegram_id=int(sender.id),
         username=sender.username,
@@ -40,12 +48,10 @@ async def ensure_user_from_sender(db: Database, sender: User) -> bool:
 
 
 def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    """Разбить длинный ответ под лимит Telegram."""
     if limit < 1:
         raise ValueError("split_message: limit должен быть >= 1")
     if len(text) <= limit:
         return [text]
-
     chunks: list[str] = []
     remaining = text
     while remaining:
@@ -61,7 +67,6 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
 
 
 async def safe_reply(event: Any, text: str) -> bool:
-    """Ответить в тот же чат, глотая типовые RPC-ошибки."""
     if not text:
         return False
     try:

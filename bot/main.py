@@ -1,10 +1,8 @@
 """
-Точка входа: Telegram USER-сессия (Telethon), не Bot API.
+Точка входа: USER-сессия, только групповые чаты.
 
-Запуск:
-    python -m bot
-Первый логин:
-    python -m bot.login
+Запуск:  python -m bot
+Логин:   python -m bot.login
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ import sys
 from bot.config import load_settings
 from bot.database import Database
 from bot.handlers import register_handlers
-from bot.services.gate import UserGate
+from bot.services.gate import ChatGate
 from bot.services.llm import LLMService
 from bot.telegram_client import build_client, setup_logging
 
@@ -24,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 async def run_userbot() -> None:
-    """Подключить user-сессию и слушать входящие ЛС."""
     try:
         settings = load_settings()
     except ValueError as exc:
@@ -36,31 +33,33 @@ async def run_userbot() -> None:
 
     db = Database(settings.database_path)
     llm = LLMService(settings)
-    gate = UserGate(min_interval_sec=1.5)
+    gate = ChatGate(min_interval_sec=2.0)
     client = build_client(settings)
 
     await db.connect()
-    register_handlers(
-        client,
-        db=db,
-        llm=llm,
-        settings=settings,
-        gate=gate,
-    )
 
     exit_code = 0
     try:
         await client.connect()
         if not await client.is_user_authorized():
             logger.error(
-                "Сессия не авторизована. Сначала выполни: python -m bot.login"
+                "Сессия не авторизована. Сначала: python -m bot.login"
             )
             exit_code = 1
             return
 
         me = await client.get_me()
+        register_handlers(
+            client,
+            db=db,
+            llm=llm,
+            settings=settings,
+            gate=gate,
+            me=me,
+        )
+
         logger.info(
-            "User-сессия активна как %s (id=%s). Слушаю личные сообщения…",
+            "User-сессия как %s (id=%s). Режим: ТОЛЬКО группы, ЛС игнор.",
             getattr(me, "username", None) or me.first_name,
             me.id,
         )

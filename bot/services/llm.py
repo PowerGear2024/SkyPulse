@@ -1,7 +1,5 @@
 """
-Клиент LLM: OpenAI (GPT-4o) или Anthropic (Claude).
-
-Таймаут на запрос обязателен — иначе hang подвесит слот user-gate навсегда.
+Клиент LLM. История чата уже содержит текущую реплику.
 """
 
 from __future__ import annotations
@@ -17,26 +15,19 @@ from bot.persona import get_system_prompt
 
 logger = logging.getLogger(__name__)
 
-# Потолок длины одной реплики в контексте (защита RAM/токенов)
 _MAX_HISTORY_MSG_CHARS = 4000
 
 
 class LLMError(Exception):
-    """Ошибка при обращении к провайдеру LLM."""
+    """Ошибка провайдера LLM."""
 
 
-def normalize_history(
+def normalize_chat_history(
     history: list[dict[str, Any]],
-    user_message: str,
 ) -> list[dict[str, str]]:
     """
-    Собрать валидную цепочку сообщений для Chat API.
-
-    - роли только user/assistant;
-    - склеивает подряд идущие реплики одной роли;
-    - убирает ведущие assistant;
-    - режет слишком длинные куски;
-    - текущее сообщение пользователя всегда в конце.
+    Подготовить ленту чата для API:
+    merge соседних одинаковых ролей, срезать leading assistant, clip длины.
     """
     merged: list[dict[str, str]] = []
 
@@ -55,22 +46,15 @@ def normalize_history(
     while merged and merged[0]["role"] != "user":
         merged.pop(0)
 
-    user_message = user_message.strip()[:_MAX_HISTORY_MSG_CHARS]
-    if not user_message:
-        raise LLMError("Пустое сообщение пользователя")
-
-    if merged and merged[-1]["role"] == "user":
-        combined = f"{merged[-1]['content']}\n{user_message}"
-        merged[-1]["content"] = combined[:_MAX_HISTORY_MSG_CHARS]
-    else:
-        merged.append({"role": "user", "content": user_message})
+    if not merged:
+        raise LLMError("Пустая история чата для ответа")
+    if merged[-1]["role"] != "user":
+        raise LLMError("Последнее сообщение в истории должно быть от собеседника")
 
     return merged
 
 
 class LLMService:
-    """Единая точка вызова LLM с поддержкой двух провайдеров."""
-
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._openai: AsyncOpenAI | None = None
@@ -90,14 +74,8 @@ class LLMService:
                 max_retries=2,
             )
 
-    async def generate_reply(
-        self,
-        history: list[dict[str, Any]],
-        user_message: str,
-    ) -> str:
-        """Сгенерировать ответ ассистента."""
-        messages = normalize_history(history, user_message)
-
+    async def generate_reply(self, history: list[dict[str, Any]]) -> str:
+        messages = normalize_chat_history(history)
         try:
             if self._settings.llm_provider == "openai":
                 return await self._call_openai(messages)
@@ -111,7 +89,6 @@ class LLMService:
     async def _call_openai(self, messages: list[dict[str, str]]) -> str:
         if self._openai is None:
             raise LLMError("OpenAI-клиент не инициализирован")
-
         try:
             response = await self._openai.chat.completions.create(
                 model=self._settings.openai_model,
@@ -133,7 +110,6 @@ class LLMService:
     async def _call_anthropic(self, messages: list[dict[str, str]]) -> str:
         if self._anthropic is None:
             raise LLMError("Anthropic-клиент не инициализирован")
-
         try:
             response = await self._anthropic.messages.create(
                 model=self._settings.anthropic_model,
@@ -146,19 +122,17 @@ class LLMService:
             logger.exception("Ошибка Anthropic API")
             raise LLMError("Anthropic API вернул ошибку") from exc
 
-        parts: list[str] = []
-        for block in response.content:
-            text = getattr(block, "text", None)
-            if text:
-                parts.append(text)
-
+        parts = [
+            getattr(block, "text", "")
+            for block in response.content
+            if getattr(block, "text", None)
+        ]
         reply = "".join(parts).strip()
         if not reply:
             raise LLMError("Anthropic вернул пустой ответ")
         return reply
 
     async def close(self) -> None:
-        """Закрыть HTTP-клиенты (идемпотентно)."""
         if self._openai is not None:
             await self._openai.close()
             self._openai = None

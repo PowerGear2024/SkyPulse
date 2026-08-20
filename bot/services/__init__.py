@@ -1,3 +1,3 @@
 """
-Сервисы бота (LLM, rate-limit).
+Сервисы: LLM, gate, human typing.
 """

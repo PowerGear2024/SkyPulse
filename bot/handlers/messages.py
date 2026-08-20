@@ -1,5 +1,9 @@
 """
-Обработка входящих личных сообщений от имени user-аккаунта.
+Только ГРУППЫ / супергруппы. Личные сообщения — полный игнор.
+
+- Пишет в память ВСЕ тексты чата (видеть смысл и логику).
+- Отвечает по GROUP_REPLY_MODE (all | mention).
+- Печатает как человек: typing в шапке + задержка от длины ответа.
 """
 
 from __future__ import annotations
@@ -8,19 +12,22 @@ import logging
 from typing import Any
 
 from telethon import TelegramClient, events
+from telethon.tl.types import User
 
 from bot.config import Settings
 from bot.database import Database
 from bot.handlers.helpers import (
     MAX_USER_CHARS,
     as_telegram_user,
+    display_name,
     ensure_user_from_sender,
     safe_reply,
     split_message,
 )
 from bot.persona import RESET_TEXT, get_start_text
-from bot.services.gate import UserGate
+from bot.services.gate import ChatGate
 from bot.services.llm import LLMError, LLMService
+from bot.services.typing import generate_with_human_typing
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +38,21 @@ def register_handlers(
     db: Database,
     llm: LLMService,
     settings: Settings,
-    gate: UserGate,
+    gate: ChatGate,
+    me: User,
 ) -> None:
-    """Подписать обработчики на Telethon-клиент."""
+    """Подписать обработчики. `me` — наш аккаунт (для mention/reply)."""
 
-    @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
-    async def on_private_message(event: events.NewMessage.Event) -> None:
-        """Только входящие ЛС (не группы, не исходящие)."""
+    @client.on(events.NewMessage(incoming=True))
+    async def on_incoming(event: events.NewMessage.Event) -> None:
+        # --- ЛС: полный игнор ---
+        if event.is_private:
+            return
+
+        # Только группы / супергруппы (broadcast-каналы — нет)
+        if not event.is_group:
+            return
+
         raw = event.message.message if event.message else None
         if not raw:
             return
@@ -46,137 +61,157 @@ def register_handlers(
         if not text:
             return
 
+        chat_id = int(event.chat_id)
+        if not settings.is_chat_allowed(chat_id):
+            return
+
         sender = as_telegram_user(await event.get_sender())
         if sender is None:
             return
 
-        user_id = int(sender.id)
+        # Свою же учётку на всякий (incoming обычно уже без нас)
+        if int(sender.id) == int(me.id):
+            return
 
-        # Whitelist: защита бюджета LLM от случайных/враждебных ЛС
-        if not settings.is_user_allowed(user_id):
-            logger.info("Игнор ЛС от user_id=%s (нет в ALLOWED_USER_IDS)", user_id)
+        if len(text) > MAX_USER_CHARS:
+            text = text[:MAX_USER_CHARS]
+
+        await ensure_user_from_sender(db, sender)
+        name = display_name(sender)
+
+        # Память: ВСЕ сообщения чата, даже если не отвечаем
+        try:
+            await db.add_chat_message(
+                chat_id,
+                text,
+                sender_id=int(sender.id),
+                sender_name=name,
+                is_me=False,
+                keep=settings.history_limit,
+            )
+        except Exception:
+            logger.exception("Не удалось сохранить сообщение chat_id=%s", chat_id)
             return
 
         lowered = text.lower()
         if lowered.startswith("/start"):
-            await _cmd_start(event, db, sender)
+            if settings.is_user_allowed(int(sender.id)):
+                await safe_reply(event, get_start_text())
             return
         if lowered.startswith("/reset"):
-            await _cmd_reset(event, db, user_id)
+            if settings.is_user_allowed(int(sender.id)):
+                await _cmd_reset(event, db, chat_id)
             return
         if text.startswith("/"):
             return
 
-        await _handle_chat(
+        if not settings.is_user_allowed(int(sender.id)):
+            return
+
+        if settings.group_reply_mode == "mention":
+            if not await _is_addressed_to_me(event, me, text):
+                return
+
+        await _reply_in_group(
             event,
             client=client,
             db=db,
             llm=llm,
             settings=settings,
             gate=gate,
-            sender=sender,
-            user_text=text,
+            chat_id=chat_id,
         )
 
 
-async def _cmd_start(event: Any, db: Database, sender: Any) -> None:
-    try:
-        await ensure_user_from_sender(db, sender)
-        await safe_reply(event, get_start_text())
-    except Exception:
-        logger.exception("Ошибка /start для user_id=%s", sender.id)
-        await safe_reply(
-            event,
-            "Что-то пошло не так на моей стороне. "
-            "Попробуй /start ещё раз через секунду.",
-        )
+async def _is_addressed_to_me(
+    event: events.NewMessage.Event,
+    me: User,
+    text: str,
+) -> bool:
+    """Упомянули / ответили на моё сообщение."""
+    if getattr(event.message, "mentioned", False):
+        return True
+    username = (me.username or "").lower()
+    if username and f"@{username}" in text.lower():
+        return True
+    if event.is_reply:
+        try:
+            reply = await event.get_reply_message()
+            if reply is not None and reply.sender_id == me.id:
+                return True
+        except Exception:
+            logger.debug("Не удалось прочитать reply", exc_info=True)
+    return False
 
 
-async def _cmd_reset(event: Any, db: Database, user_id: int) -> None:
+async def _cmd_reset(event: Any, db: Database, chat_id: int) -> None:
     try:
-        await db.clear_history(user_id)
+        await db.clear_chat_history(chat_id)
         await safe_reply(event, RESET_TEXT)
     except Exception:
-        logger.exception("Ошибка /reset для user_id=%s", user_id)
-        await safe_reply(event, "Не вышло сбросить историю. Попробуй ещё раз.")
+        logger.exception("Ошибка /reset chat_id=%s", chat_id)
+        await safe_reply(event, "Не вышло сбросить память чата. Ещё раз?")
 
 
-async def _handle_chat(
+async def _reply_in_group(
     event: Any,
     *,
     client: TelegramClient,
     db: Database,
     llm: LLMService,
     settings: Settings,
-    gate: UserGate,
-    sender: Any,
-    user_text: str,
+    gate: ChatGate,
+    chat_id: int,
 ) -> None:
-    user_id = int(sender.id)
-    if len(user_text) > MAX_USER_CHARS:
-        user_text = user_text[:MAX_USER_CHARS]
-
-    if not gate.try_begin(user_id):
-        await safe_reply(
-            event,
-            "Я ещё ковыряюсь с прошлым сообщением — секунду, не долби.",
-        )
+    if not gate.try_begin(chat_id):
+        # Уже печатаем в этом чате — молча (по-человечески, без спама «подожди»)
         return
 
     try:
-        wait = gate.seconds_until_allowed(user_id)
-        if wait > 0:
-            await safe_reply(
-                event,
-                f"Эй, притормози на {wait:.1f} сек — я не автомат по спаму.",
-            )
+        if gate.seconds_until_allowed(chat_id) > 0:
             return
 
-        gate.mark_used(user_id)
-        await ensure_user_from_sender(db, sender)
-        history = await db.get_history(user_id, limit=settings.history_limit)
+        gate.mark_used(chat_id)
 
-        reply: str | None = None
-        try:
-            async with client.action(event.chat_id, "typing"):
-                reply = await llm.generate_reply(
-                    history=history,
-                    user_message=user_text,
-                )
-        except LLMError:
-            raise
-        except Exception:
-            # Упал сам typing-индикатор — генерим без него (без повторного вызова, если ответ уже есть)
-            logger.debug("typing action failed user_id=%s", user_id, exc_info=True)
-            if reply is None:
-                reply = await llm.generate_reply(
-                    history=history,
-                    user_message=user_text,
-                )
+        history = await db.get_chat_history_for_llm(
+            chat_id, limit=settings.history_limit
+        )
 
-        await db.add_exchange(
-            user_id,
-            user_text,
+        async def _produce() -> str:
+            return await llm.generate_reply(history)
+
+        reply = await generate_with_human_typing(
+            client,
+            chat_id,
+            _produce,
+        )
+
+        await db.add_chat_message(
+            chat_id,
             reply,
+            sender_id=None,
+            sender_name=None,
+            is_me=True,
             keep=settings.history_limit,
         )
 
         for chunk in split_message(reply):
+            # Между кусками тоже чуть «допечатываем»
             if not await safe_reply(event, chunk):
                 break
 
     except LLMError:
-        logger.warning("Сбой генерации для user_id=%s", user_id)
+        logger.warning("Сбой генерации chat_id=%s", chat_id)
+        # Без технических отмазок про «модель»
         await safe_reply(
             event,
-            "Инет у меня моргнул / сервис подвис. Кинь ещё раз через минуту.",
+            "Блин, мысль оборвалась / инет моргнул. Напиши ещё раз чуть позже.",
         )
     except Exception:
-        logger.exception("Ошибка обработки сообщения user_id=%s", user_id)
+        logger.exception("Ошибка ответа в группе chat_id=%s", chat_id)
         await safe_reply(
             event,
-            "Что-то у меня в голове щёлкнуло не так. "
-            "Попробуй ещё раз или /reset.",
+            "Что-то у меня в голове щёлкнуло не так. Кинь /reset или повтори.",
         )
     finally:
-        gate.end(user_id)
+        gate.end(chat_id)

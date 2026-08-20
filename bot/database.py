@@ -1,11 +1,9 @@
 """
-Асинхронный слой работы с SQLite.
+Память группового чата + профили отправителей.
 
-Хранит:
-  - пользователей (telegram_id + метаданные);
-  - историю диалога (последние N реплик на пользователя).
-
-Все запросы параметризованы — SQL-инъекции через контент исключены.
+Все текстовые сообщения группы пишутся в chat_messages,
+чтобы модель видела весь ход переписки, смысл и логику.
+ЛС не пишем сюда — они полностью игнорируются на уровне хендлера.
 """
 
 from __future__ import annotations
@@ -21,6 +19,7 @@ logger = logging.getLogger(__name__)
 _MAX_USERNAME_LEN = 64
 _MAX_NAME_LEN = 128
 _MAX_CONTENT_LEN = 4096
+_MAX_SENDER_NAME = 64
 
 
 def _clip(value: str | None, max_len: int) -> str | None:
@@ -30,7 +29,7 @@ def _clip(value: str | None, max_len: int) -> str | None:
 
 
 class Database:
-    """Обёртка над aiosqlite с параметризованными запросами."""
+    """SQLite: users + лента сообщений по chat_id."""
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
@@ -45,7 +44,6 @@ class Database:
         return self._connection
 
     async def connect(self) -> None:
-        """Открыть соединение и создать таблицы (идемпотентно)."""
         if self._connection is not None:
             return
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,7 +56,6 @@ class Database:
         logger.info("SQLite подключена: %s", self._db_path)
 
     async def close(self) -> None:
-        """Закрыть соединение (идемпотентно)."""
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
@@ -76,18 +73,20 @@ class Database:
                 updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
-            CREATE TABLE IF NOT EXISTS messages (
+            -- Лента ВСЕХ сообщений группы (память чата)
+            CREATE TABLE IF NOT EXISTS chat_messages (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER NOT NULL,
-                role        TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                chat_id     INTEGER NOT NULL,
+                sender_id   INTEGER,
+                sender_name TEXT,
+                is_me       INTEGER NOT NULL DEFAULT 0
+                            CHECK (is_me IN (0, 1)),
                 content     TEXT NOT NULL,
-                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
-                    ON DELETE CASCADE
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
-            CREATE INDEX IF NOT EXISTS idx_messages_user_id
-                ON messages (telegram_id, id);
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id
+                ON chat_messages (chat_id, id);
             """
         )
         await self.connection.commit()
@@ -99,12 +98,6 @@ class Database:
         first_name: str | None = None,
         last_name: str | None = None,
     ) -> bool:
-        """
-        Сохранить или обновить пользователя в одной транзакции.
-
-        Returns:
-            True, если пользователь новый.
-        """
         if telegram_id <= 0:
             raise ValueError(f"Некорректный telegram_id: {telegram_id}")
 
@@ -123,7 +116,6 @@ class Database:
                 (telegram_id, username, first_name, last_name),
             )
             is_new = cursor.rowcount == 1
-
             if not is_new:
                 await self.connection.execute(
                     """
@@ -136,13 +128,7 @@ class Database:
                     """,
                     (username, first_name, last_name, telegram_id),
                 )
-
             await self.connection.commit()
-
-            if is_new:
-                logger.info(
-                    "Новый пользователь: id=%s username=%s", telegram_id, username
-                )
             return is_new
         except Exception:
             try:
@@ -152,97 +138,115 @@ class Database:
             logger.exception("Ошибка upsert_user для telegram_id=%s", telegram_id)
             raise
 
-    async def add_exchange(
+    async def add_chat_message(
         self,
-        telegram_id: int,
-        user_content: str,
-        assistant_content: str,
+        chat_id: int,
+        content: str,
         *,
+        sender_id: int | None = None,
+        sender_name: str | None = None,
+        is_me: bool = False,
         keep: int | None = None,
     ) -> None:
-        """Сохранить пару user/assistant (+ optional trim) в одной транзакции."""
-        user_content = (user_content or "").strip()[:_MAX_CONTENT_LEN]
-        assistant_content = (assistant_content or "").strip()[:_MAX_CONTENT_LEN]
-        if not user_content or not assistant_content:
-            raise ValueError("add_exchange: пустой user/assistant контент")
-        if keep is not None and keep < 2:
-            raise ValueError("add_exchange: keep должен быть >= 2")
+        """Добавить одно сообщение в память чата (+ optional trim)."""
+        content = (content or "").strip()[:_MAX_CONTENT_LEN]
+        if not content:
+            raise ValueError("add_chat_message: пустой content")
+        sender_name = _clip(sender_name, _MAX_SENDER_NAME)
 
         try:
             await self.connection.execute("BEGIN")
             await self.connection.execute(
                 """
-                INSERT INTO messages (telegram_id, role, content)
-                VALUES (?, 'user', ?)
+                INSERT INTO chat_messages
+                    (chat_id, sender_id, sender_name, is_me, content)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (telegram_id, user_content),
-            )
-            await self.connection.execute(
-                """
-                INSERT INTO messages (telegram_id, role, content)
-                VALUES (?, 'assistant', ?)
-                """,
-                (telegram_id, assistant_content),
+                (
+                    chat_id,
+                    sender_id,
+                    sender_name,
+                    1 if is_me else 0,
+                    content,
+                ),
             )
             if keep is not None:
-                await self._trim_history_locked(telegram_id, keep)
+                if keep < 2:
+                    raise ValueError("keep должен быть >= 2")
+                await self._trim_chat_locked(chat_id, keep)
             await self.connection.commit()
         except Exception:
             try:
                 await self.connection.rollback()
             except aiosqlite.Error:
-                logger.exception("Не удалось откатить транзакцию add_exchange")
+                logger.exception("Не удалось откатить add_chat_message")
             logger.exception(
-                "Ошибка add_exchange для telegram_id=%s", telegram_id
+                "Ошибка add_chat_message chat_id=%s", chat_id
             )
             raise
 
-    async def get_history(
+    async def get_chat_history_for_llm(
         self,
-        telegram_id: int,
+        chat_id: int,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """Последние `limit` реплик в хронологическом порядке."""
+        """
+        Последние `limit` сообщений чата → формат Chat API.
+
+        Чужие: role=user, content='[Имя]: текст'
+        Мои:    role=assistant, content=текст
+        """
         if limit < 1:
             return []
         try:
             cursor = await self.connection.execute(
                 """
-                SELECT role, content
+                SELECT sender_name, is_me, content
                 FROM (
-                    SELECT role, content, id
-                    FROM messages
-                    WHERE telegram_id = ?
+                    SELECT sender_name, is_me, content, id
+                    FROM chat_messages
+                    WHERE chat_id = ?
                     ORDER BY id DESC
                     LIMIT ?
                 ) AS recent
                 ORDER BY id ASC
                 """,
-                (telegram_id, limit),
+                (chat_id, limit),
             )
             rows = await cursor.fetchall()
-            return [
-                {"role": row["role"], "content": row["content"]} for row in rows
-            ]
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                if row["is_me"]:
+                    result.append(
+                        {"role": "assistant", "content": row["content"]}
+                    )
+                else:
+                    name = (row["sender_name"] or "Кто-то").strip() or "Кто-то"
+                    result.append(
+                        {
+                            "role": "user",
+                            "content": f"[{name}]: {row['content']}",
+                        }
+                    )
+            return result
         except aiosqlite.Error:
             logger.exception(
-                "Ошибка get_history для telegram_id=%s", telegram_id
+                "Ошибка get_chat_history_for_llm chat_id=%s", chat_id
             )
             raise
 
-    async def _trim_history_locked(self, telegram_id: int, keep: int) -> int:
-        """Trim внутри уже открытой транзакции (без commit)."""
+    async def _trim_chat_locked(self, chat_id: int, keep: int) -> int:
         cursor = await self.connection.execute(
             """
-            DELETE FROM messages
-            WHERE telegram_id = ?
+            DELETE FROM chat_messages
+            WHERE chat_id = ?
               AND id < COALESCE(
                   (
                       SELECT MIN(id)
                       FROM (
                           SELECT id
-                          FROM messages
-                          WHERE telegram_id = ?
+                          FROM chat_messages
+                          WHERE chat_id = ?
                           ORDER BY id DESC
                           LIMIT ?
                       )
@@ -250,21 +254,21 @@ class Database:
                   0
               )
             """,
-            (telegram_id, telegram_id, keep),
+            (chat_id, chat_id, keep),
         )
         return cursor.rowcount if cursor.rowcount is not None else 0
 
-    async def clear_history(self, telegram_id: int) -> None:
-        """Полностью очистить историю диалога (/reset)."""
+    async def clear_chat_history(self, chat_id: int) -> None:
+        """Сброс памяти конкретного чата (/reset)."""
         try:
             await self.connection.execute(
-                "DELETE FROM messages WHERE telegram_id = ?",
-                (telegram_id,),
+                "DELETE FROM chat_messages WHERE chat_id = ?",
+                (chat_id,),
             )
             await self.connection.commit()
-            logger.info("История очищена для telegram_id=%s", telegram_id)
+            logger.info("Память чата очищена chat_id=%s", chat_id)
         except aiosqlite.Error:
             logger.exception(
-                "Ошибка clear_history для telegram_id=%s", telegram_id
+                "Ошибка clear_chat_history chat_id=%s", chat_id
             )
             raise

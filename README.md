@@ -1,51 +1,33 @@
-# SkyPulse — Telegram user-session AI (Telethon + SQLite + OpenAI/Anthropic)
+# SkyPulse — Telegram user-session в ГРУППАХ (Telethon)
 
-Собеседник отвечает **от твоего аккаунта** (user-сессия), не через @BotFather.
-Роль: Даниил Коваль из Одессы. История в SQLite, ответы через GPT-4o / Claude.
+Отвечает **от твоего аккаунта** только в групповых чатах. **ЛС полностью игнор.**
+Печатает как человек (typing в шапке + пауза от длины текста).
+Память: видит все сообщения чата. Персона: Даня из Одессы — никогда не ИИ.
 
-## Структура
-
-```
-bot/
-  main.py                 # python -m bot
-  login.py                # python -m bot.login
-  telegram_client.py      # сборка Telethon-клиента
-  config.py               # .env + whitelist
-  persona.py
-  database.py
-  handlers/messages.py
-  services/gate.py
-  services/llm.py
-```
-
-## Быстрый старт
+## Запуск
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-```
+# TELEGRAM_API_ID / HASH с https://my.telegram.org/apps + ключ LLM
+# Рекомендуется ALLOWED_CHAT_IDS=-100...
 
-В `.env`:
-1. `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` с https://my.telegram.org/apps
-2. Ключ LLM
-3. **Рекомендуется** `ALLOWED_USER_IDS=123456789` — кому отвечать в ЛС
-
-```bash
-python -m bot.login   # телефон + код, один раз
+python -m bot.login
 python -m bot
 ```
 
-## Команды в ЛС
+## Поведение
 
-| Текст | Действие |
+| | |
 |---|---|
-| `/start` | Приветствие + запись в БД |
-| `/reset` | Очистить историю |
-| любой текст | Ответ в образе Дани |
+| ЛС | полный игнор |
+| Группы | читает все тексты в память |
+| Ответ | `GROUP_REPLY_MODE=all` или `mention` |
+| Печать | индикатор «печатает…» + задержка ~длина ответа |
+| `/start` | приветствие |
+| `/reset` | очистить память этого чата |
 
-## Безопасность
+## Важно
 
-- `*.session` / `TELEGRAM_SESSION_STRING` = полный доступ к аккаунту, как пароль
-- Пустой `ALLOWED_USER_IDS` = любой человек в ЛС жжёт твой LLM-бюджет
-- Автоматизация user-аккаунта может нарушать ToS Telegram
+- `*.session` / `TELEGRAM_SESSION_STRING` = доступ к аккаунту
+- Userbot может нарушать ToS Telegram

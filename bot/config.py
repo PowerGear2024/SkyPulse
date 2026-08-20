@@ -1,7 +1,5 @@
 """
-Модуль конфигурации.
-
-Загружает переменные из .env и валидирует параметры user-сессии Telegram.
+Модуль конфигурации (user-сессия, группы, whitelist).
 """
 
 from __future__ import annotations
@@ -19,20 +17,19 @@ load_dotenv(_PROJECT_ROOT / ".env")
 
 logger = logging.getLogger(__name__)
 
-# Имя сессии: только безопасные символы (защита от path traversal)
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    """Неизменяемый снимок настроек userbot'а."""
-
     telegram_api_id: int
     telegram_api_hash: str
     session_name: str
     session_string: str
     session_dir: Path
+    allowed_chat_ids: frozenset[int]
     allowed_user_ids: frozenset[int]
+    group_reply_mode: str
     llm_provider: str
     openai_api_key: str
     anthropic_api_key: str
@@ -46,11 +43,14 @@ class Settings:
 
     @property
     def session_path(self) -> Path:
-        """Путь к файлу сессии Telethon (без суффикса .session)."""
         return self.session_dir / self.session_name
 
+    def is_chat_allowed(self, chat_id: int) -> bool:
+        if not self.allowed_chat_ids:
+            return True
+        return chat_id in self.allowed_chat_ids
+
     def is_user_allowed(self, user_id: int) -> bool:
-        """True, если whitelist пуст (все) или user_id в списке."""
         if not self.allowed_user_ids:
             return True
         return user_id in self.allowed_user_ids
@@ -70,12 +70,7 @@ def _optional(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip() or default
 
 
-def _parse_allowed_ids(raw: str) -> frozenset[int]:
-    """
-    ALLOWED_USER_IDS=123,456 или пусто (= все).
-
-    Пустой whitelist = отвечать всем (удобно, но жрёт бюджет).
-    """
+def _parse_id_list(raw: str, field: str) -> frozenset[int]:
     if not raw:
         return frozenset()
     ids: set[int] = set()
@@ -84,19 +79,19 @@ def _parse_allowed_ids(raw: str) -> frozenset[int]:
         if not part:
             continue
         try:
-            uid = int(part)
+            value = int(part)
         except ValueError as exc:
             raise ValueError(
-                f"ALLOWED_USER_IDS: ожидались целые id через запятую, кусок={part!r}"
+                f"{field}: ожидались целые id через запятую, кусок={part!r}"
             ) from exc
-        if uid <= 0:
-            raise ValueError(f"ALLOWED_USER_IDS: id должен быть > 0, получено {uid}")
-        ids.add(uid)
+        # chat_id у супергрупп отрицательный — разрешаем любой != 0
+        if value == 0:
+            raise ValueError(f"{field}: id не может быть 0")
+        ids.add(value)
     return frozenset(ids)
 
 
 def load_settings() -> Settings:
-    """Прочитать и провалидировать настройки из окружения."""
     try:
         api_id = int(_require("TELEGRAM_API_ID"))
     except ValueError as exc:
@@ -111,12 +106,20 @@ def load_settings() -> Settings:
     session_name = _optional("TELEGRAM_SESSION_NAME", "user")
     if not _SESSION_NAME_RE.fullmatch(session_name):
         raise ValueError(
-            "TELEGRAM_SESSION_NAME: только латиница/цифры/_/- , длина 1–64 "
-            "(без путей вроде ../)"
+            "TELEGRAM_SESSION_NAME: только латиница/цифры/_/- , длина 1–64"
         )
 
     session_string = _optional("TELEGRAM_SESSION_STRING")
-    allowed_user_ids = _parse_allowed_ids(_optional("ALLOWED_USER_IDS"))
+    allowed_chat_ids = _parse_id_list(
+        _optional("ALLOWED_CHAT_IDS"), "ALLOWED_CHAT_IDS"
+    )
+    allowed_user_ids = _parse_id_list(
+        _optional("ALLOWED_USER_IDS"), "ALLOWED_USER_IDS"
+    )
+
+    group_reply_mode = _optional("GROUP_REPLY_MODE", "all").lower()
+    if group_reply_mode not in {"all", "mention"}:
+        raise ValueError("GROUP_REPLY_MODE: 'all' или 'mention'")
 
     llm_provider = _optional("LLM_PROVIDER", "openai").lower()
     if llm_provider not in {"openai", "anthropic"}:
@@ -127,28 +130,25 @@ def load_settings() -> Settings:
     openai_api_key = _optional("OPENAI_API_KEY")
     anthropic_api_key = _optional("ANTHROPIC_API_KEY")
     if llm_provider == "openai" and not openai_api_key:
-        raise ValueError("Для LLM_PROVIDER=openai нужен OPENAI_API_KEY в .env")
+        raise ValueError("Для LLM_PROVIDER=openai нужен OPENAI_API_KEY")
     if llm_provider == "anthropic" and not anthropic_api_key:
-        raise ValueError("Для LLM_PROVIDER=anthropic нужен ANTHROPIC_API_KEY в .env")
+        raise ValueError("Для LLM_PROVIDER=anthropic нужен ANTHROPIC_API_KEY")
 
     try:
         temperature = float(_optional("LLM_TEMPERATURE", "0.85"))
     except ValueError as exc:
-        raise ValueError("LLM_TEMPERATURE должна быть числом, например 0.85") from exc
+        raise ValueError("LLM_TEMPERATURE должна быть числом") from exc
     if not 0.0 <= temperature <= 2.0:
         raise ValueError("LLM_TEMPERATURE должна быть в диапазоне 0.0–2.0")
 
     try:
-        history_limit = int(_optional("HISTORY_LIMIT", "14"))
+        history_limit = int(_optional("HISTORY_LIMIT", "30"))
     except ValueError as exc:
         raise ValueError("HISTORY_LIMIT должна быть целым числом") from exc
-    if history_limit < 2:
-        raise ValueError("HISTORY_LIMIT должен быть >= 2")
-    if history_limit > 40:
-        logger.warning(
-            "HISTORY_LIMIT=%s довольно большой — контекст LLM раздуется",
-            history_limit,
-        )
+    if history_limit < 4:
+        raise ValueError("HISTORY_LIMIT должен быть >= 4 (память чата)")
+    if history_limit > 80:
+        logger.warning("HISTORY_LIMIT=%s большой — дорогой контекст", history_limit)
 
     try:
         llm_timeout_sec = float(_optional("LLM_TIMEOUT_SEC", "90"))
@@ -174,7 +174,9 @@ def load_settings() -> Settings:
         session_name=session_name,
         session_string=session_string,
         session_dir=session_dir,
+        allowed_chat_ids=allowed_chat_ids,
         allowed_user_ids=allowed_user_ids,
+        group_reply_mode=group_reply_mode,
         llm_provider=llm_provider,
         openai_api_key=openai_api_key,
         anthropic_api_key=anthropic_api_key,
@@ -188,19 +190,15 @@ def load_settings() -> Settings:
     )
 
     logger.info(
-        "Конфиг: session=%s, allowlist=%s, provider=%s, model=%s, temp=%.2f, history=%s",
-        "string" if settings.session_string else settings.session_name,
+        "Конфиг: groups-only, reply=%s, chats=%s, users=%s, history=%s",
+        settings.group_reply_mode,
+        len(settings.allowed_chat_ids) or "ALL",
         len(settings.allowed_user_ids) or "ALL",
-        settings.llm_provider,
-        settings.openai_model
-        if settings.llm_provider == "openai"
-        else settings.anthropic_model,
-        settings.llm_temperature,
         settings.history_limit,
     )
-    if not settings.allowed_user_ids:
+    if not settings.allowed_chat_ids:
         logger.warning(
-            "ALLOWED_USER_IDS пуст — отвечаю ВСЕМ в ЛС. "
-            "Для защиты бюджета укажи id через запятую."
+            "ALLOWED_CHAT_IDS пуст — работаю во ВСЕХ группах. "
+            "Лучше укажи id чатов."
         )
     return settings
