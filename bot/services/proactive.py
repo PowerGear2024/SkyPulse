@@ -16,6 +16,7 @@ from bot.config import Settings
 from bot.database import Database
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMError, LLMService
+from bot.services.presence import OwnerGuard
 from bot.services.responder import send_prepared
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ async def proactive_loop(
     llm: LLMService,
     settings: Settings,
     gate: ChatGate,
+    guard: OwnerGuard,
     me: User,
     stop_event: asyncio.Event,
 ) -> None:
@@ -62,6 +64,7 @@ async def proactive_loop(
                 llm=llm,
                 settings=settings,
                 gate=gate,
+                guard=guard,
                 my_id=my_id,
             )
         except Exception:
@@ -83,8 +86,14 @@ async def _maybe_proactive_once(
     llm: LLMService,
     settings: Settings,
     gate: ChatGate,
+    guard: OwnerGuard,
     my_id: int,
 ) -> None:
+    blocked = guard.block_reason()
+    if blocked:
+        logger.debug("Проактив: пауза (%s)", blocked)
+        return
+
     used = await db.count_proactive_today()
     if used >= settings.proactive_max_per_day:
         logger.debug("Проактив: лимит дня исчерпан (%s)", used)
@@ -138,6 +147,7 @@ async def _maybe_proactive_once(
             db=db,
             settings=settings,
             gate=gate,
+            guard=guard,
             chat_id=chat_id,
             my_id=my_id,
             text=reply,

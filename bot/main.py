@@ -16,6 +16,7 @@ from bot.database import Database
 from bot.handlers import register_handlers
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMService
+from bot.services.presence import OwnerGuard
 from bot.services.proactive import proactive_loop
 from bot.telegram_client import build_client, setup_logging
 
@@ -35,6 +36,17 @@ async def run_userbot() -> None:
     db = Database(settings.database_path)
     llm = LLMService(settings)
     gate = ChatGate(min_interval_sec=2.0)
+    try:
+        guard = OwnerGuard(
+            timezone=settings.timezone,
+            work_start_hour=settings.work_hours_start,
+            work_end_hour=settings.work_hours_end,
+            idle_resume_sec=settings.owner_idle_resume_sec,
+        )
+    except ValueError as exc:
+        logging.error("Ошибка OwnerGuard: %s", exc)
+        sys.exit(1)
+
     client = build_client(settings)
     stop_event = asyncio.Event()
     proactive_task: asyncio.Task | None = None
@@ -63,6 +75,7 @@ async def run_userbot() -> None:
             llm=llm,
             settings=settings,
             gate=gate,
+            guard=guard,
             me=me,
         )
 
@@ -73,6 +86,7 @@ async def run_userbot() -> None:
                 llm=llm,
                 settings=settings,
                 gate=gate,
+                guard=guard,
                 me=me,
                 stop_event=stop_event,
             ),
@@ -80,9 +94,13 @@ async def run_userbot() -> None:
         )
 
         logger.info(
-            "User-сессия как %s (id=%s). Группы: mention/reply + реакции + проактив≤%s/день. ЛС игнор.",
+            "User-сессия как %s (id=%s). Часы %02d–%02d %s; "
+            "пауза пока владелец в TG; mention/реакции/проактив≤%s.",
             getattr(me, "username", None) or me.first_name,
             me.id,
+            settings.work_hours_start,
+            settings.work_hours_end,
+            settings.timezone,
             settings.proactive_max_per_day,
         )
         await client.run_until_disconnected()

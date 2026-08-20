@@ -27,6 +27,7 @@ from bot.database import Database
 from bot.handlers.helpers import as_telegram_user, display_name, ensure_user_from_sender
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMService
+from bot.services.presence import OwnerGuard
 from bot.services.responder import generate_and_send
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ def register_reaction_handlers(
     llm: LLMService,
     settings: Settings,
     gate: ChatGate,
+    guard: OwnerGuard,
     me: User,
 ) -> None:
     if not settings.reply_on_reactions:
@@ -65,6 +67,7 @@ def register_reaction_handlers(
                 llm=llm,
                 settings=settings,
                 gate=gate,
+                guard=guard,
                 me=me,
                 my_id=my_id,
                 seen=seen,
@@ -81,6 +84,7 @@ async def _handle_reaction_update(
     llm: LLMService,
     settings: Settings,
     gate: ChatGate,
+    guard: OwnerGuard,
     me: User,
     my_id: int,
     seen: dict[tuple[int, int, int], float],
@@ -134,6 +138,11 @@ async def _handle_reaction_update(
         return
 
     if not settings.is_user_allowed(reactor_id):
+        return
+
+    blocked = guard.block_reason()
+    if blocked:
+        logger.debug("Реакция пропущена chat=%s: %s", chat_id, blocked)
         return
 
     msg_id = int(update.msg_id)
@@ -199,6 +208,7 @@ async def _handle_reaction_update(
         llm=llm,
         settings=settings,
         gate=gate,
+        guard=guard,
         chat_id=chat_id,
         my_id=my_id,
         history_extra=extra,

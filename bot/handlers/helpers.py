@@ -66,11 +66,15 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
-async def safe_reply(event: Any, text: str) -> bool:
+async def safe_reply(event: Any, text: str, *, guard: Any | None = None) -> bool:
     if not text:
         return False
     try:
-        await event.respond(text)
+        if guard is not None:
+            with guard.bot_outbound():
+                await event.respond(text)
+        else:
+            await event.respond(text)
         return True
     except FloodWaitError as exc:
         logger.warning("FloodWait %ss — пропускаю ответ", exc.seconds)

@@ -35,6 +35,10 @@ class Settings:
     proactive_max_per_day: int
     proactive_check_sec: int
     proactive_chance: float
+    timezone: str
+    work_hours_start: int
+    work_hours_end: int
+    owner_idle_resume_sec: float
     llm_provider: str
     openai_api_key: str
     anthropic_api_key: str
@@ -181,6 +185,17 @@ def load_settings() -> Settings:
     if not 0.0 <= proactive_chance <= 1.0:
         raise ValueError("PROACTIVE_CHANCE: 0.0–1.0")
 
+    timezone = _optional("TIMEZONE", "Europe/Kyiv")
+    try:
+        work_hours_start = int(_optional("WORK_HOURS_START", "8"))
+        work_hours_end = int(_optional("WORK_HOURS_END", "18"))
+    except ValueError as exc:
+        raise ValueError("WORK_HOURS_START/END должны быть целыми") from exc
+    try:
+        owner_idle_resume_sec = float(_optional("OWNER_IDLE_RESUME_SEC", "600"))
+    except ValueError as exc:
+        raise ValueError("OWNER_IDLE_RESUME_SEC должна быть числом") from exc
+
     llm_provider = _optional("LLM_PROVIDER", "openai").lower()
     if llm_provider not in {"openai", "anthropic"}:
         raise ValueError(
@@ -242,6 +257,10 @@ def load_settings() -> Settings:
         proactive_max_per_day=proactive_max_per_day,
         proactive_check_sec=proactive_check_sec,
         proactive_chance=proactive_chance,
+        timezone=timezone,
+        work_hours_start=work_hours_start,
+        work_hours_end=work_hours_end,
+        owner_idle_resume_sec=owner_idle_resume_sec,
         llm_provider=llm_provider,
         openai_api_key=openai_api_key,
         anthropic_api_key=anthropic_api_key,
@@ -256,11 +275,14 @@ def load_settings() -> Settings:
 
     logger.info(
         "Конфиг: groups-only, reply=%s, reactions=%s, proactive=%s/%s/day, "
-        "chats=%s, users=%s, history=%s",
+        "hours=%02d-%02d %s, chats=%s, users=%s, history=%s",
         settings.group_reply_mode,
         settings.reply_on_reactions,
         settings.proactive_enabled,
         settings.proactive_max_per_day,
+        settings.work_hours_start,
+        settings.work_hours_end,
+        settings.timezone,
         len(settings.allowed_chat_ids) or "ALL",
         len(settings.allowed_user_ids) or "ALL",
         settings.history_limit,

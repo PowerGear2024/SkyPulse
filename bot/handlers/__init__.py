@@ -10,9 +10,11 @@ from telethon.tl.types import User
 from bot.config import Settings
 from bot.database import Database
 from bot.handlers.messages import register_message_handlers
+from bot.handlers.presence import register_presence_handlers
 from bot.handlers.reactions import register_reaction_handlers
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMService
+from bot.services.presence import OwnerGuard
 
 
 def register_handlers(
@@ -22,13 +24,17 @@ def register_handlers(
     llm: LLMService,
     settings: Settings,
     gate: ChatGate,
+    guard: OwnerGuard,
     me: User,
 ) -> None:
+    register_presence_handlers(
+        client, db=db, settings=settings, guard=guard, me=me
+    )
     register_message_handlers(
-        client, db=db, llm=llm, settings=settings, gate=gate, me=me
+        client, db=db, llm=llm, settings=settings, gate=gate, guard=guard, me=me
     )
     register_reaction_handlers(
-        client, db=db, llm=llm, settings=settings, gate=gate, me=me
+        client, db=db, llm=llm, settings=settings, gate=gate, guard=guard, me=me
     )
 
 

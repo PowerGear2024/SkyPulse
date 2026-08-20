@@ -2,9 +2,8 @@
 Только ГРУППЫ / супергруппы. Личные сообщения — полный игнор.
 
 - Пишет в память все тексты чата (кроме служебных команд).
-- Отвечает по умолчанию только на @упоминание / reply на своё сообщение
-  (GROUP_REPLY_MODE=mention). Режим all — опционально.
-- Печатает как человек: typing в шапке + задержка от длины ответа.
+- Отвечает по умолчанию только на @упоминание / reply на своё сообщение.
+- Молчит вне рабочих часов и пока владелец сам в Telegram.
 """
 
 from __future__ import annotations
@@ -27,16 +26,13 @@ from bot.handlers.helpers import (
 from bot.persona import RESET_TEXT, get_start_text
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMService
+from bot.services.presence import OwnerGuard
 from bot.services.responder import generate_and_send
 
 logger = logging.getLogger(__name__)
 
 
 def _is_command(text: str, name: str) -> bool:
-    """
-    Точная команда: /name, /name@bot, /name args.
-    Не срабатывает на /nameSomething.
-    """
     first = text.split(None, 1)[0].lower()
     base = first.split("@", 1)[0]
     return base == f"/{name}"
@@ -49,13 +45,11 @@ def register_message_handlers(
     llm: LLMService,
     settings: Settings,
     gate: ChatGate,
+    guard: OwnerGuard,
     me: User,
 ) -> None:
-    """Подписать обработчики NewMessage. `me` — наш аккаунт."""
-
     @client.on(events.NewMessage(incoming=True))
     async def on_incoming(event: events.NewMessage.Event) -> None:
-        # Только группы / супергруппы. ЛС и каналы-вещалки — полный игнор.
         if not event.is_group:
             return
 
@@ -84,19 +78,17 @@ def register_message_handlers(
         await ensure_user_from_sender(db, sender)
         name = display_name(sender)
 
-        # Команды — НЕ засоряем память чата
         if _is_command(text, "start"):
-            if settings.is_user_allowed(int(sender.id)):
-                await safe_reply(event, get_start_text())
+            if settings.is_user_allowed(int(sender.id)) and guard.can_act():
+                await safe_reply(event, get_start_text(), guard=guard)
             return
         if _is_command(text, "reset"):
-            if settings.is_user_allowed(int(sender.id)):
-                await _cmd_reset(event, db, chat_id)
+            if settings.is_user_allowed(int(sender.id)) and guard.can_act():
+                await _cmd_reset(event, db, chat_id, guard=guard)
             return
         if text.startswith("/"):
             return
 
-        # Память: все обычные тексты (даже если не отвечаем)
         try:
             await db.add_chat_message(
                 chat_id,
@@ -113,10 +105,16 @@ def register_message_handlers(
         if not settings.is_user_allowed(int(sender.id)):
             return
 
-        # По умолчанию — только отметка / reply на наше сообщение
         if settings.group_reply_mode == "mention":
             if not await _is_addressed_to_me(event, me, text):
                 return
+
+        blocked = guard.block_reason()
+        if blocked:
+            logger.debug(
+                "Молчу (mention) chat=%s reason=%s", chat_id, blocked
+            )
+            return
 
         await generate_and_send(
             client,
@@ -124,6 +122,7 @@ def register_message_handlers(
             llm=llm,
             settings=settings,
             gate=gate,
+            guard=guard,
             chat_id=chat_id,
             my_id=int(me.id),
             reply_to=event.message.id if event.message else None,
@@ -135,7 +134,6 @@ async def _is_addressed_to_me(
     me: User,
     text: str,
 ) -> bool:
-    """Упомянули / ответили на моё сообщение."""
     if getattr(event.message, "mentioned", False):
         return True
     username = (me.username or "").lower()
@@ -151,10 +149,14 @@ async def _is_addressed_to_me(
     return False
 
 
-async def _cmd_reset(event: Any, db: Database, chat_id: int) -> None:
+async def _cmd_reset(
+    event: Any, db: Database, chat_id: int, *, guard: OwnerGuard
+) -> None:
     try:
         await db.clear_chat_history(chat_id)
-        await safe_reply(event, RESET_TEXT)
+        await safe_reply(event, RESET_TEXT, guard=guard)
     except Exception:
         logger.exception("Ошибка /reset chat_id=%s", chat_id)
-        await safe_reply(event, "Не вышло сбросить память чата. Ещё раз?")
+        await safe_reply(
+            event, "Не вышло сбросить память чата. Ещё раз?", guard=guard
+        )

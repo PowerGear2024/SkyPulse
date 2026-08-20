@@ -25,6 +25,8 @@ python -m bot
 | Ответ | по умолчанию только `@mention` / reply на твоё сообщение |
 | Реакции | ответ, если поставили реакцию на **твоё** сообщение |
 | Проактив | иногда коммент по теме 10 смс одного юзера, ≤5 раз/день |
+| Часы | только `WORK_HOURS_START`–`WORK_HOURS_END` (`TIMEZONE`) |
+| Пауза | если ты сам пишешь с аккаунта — бот молчит до выхода из TG |
 | Печать | индикатор «печатает…» + задержка ~длина ответа |
 | `/start` | приветствие |
 | `/reset` | очистить память этого чата |
@@ -34,6 +36,8 @@ python -m bot
 - `GROUP_REPLY_MODE=mention` (или `all`)
 - `REPLY_ON_REACTIONS=true`
 - `PROACTIVE_ENABLED=true`, `PROACTIVE_MAX_PER_DAY=5`
+- `TIMEZONE=Europe/Kyiv`, `WORK_HOURS_START=8`, `WORK_HOURS_END=18`
+- `OWNER_IDLE_RESUME_SEC=600` — запасной съём паузы, если offline-статус не пришёл
 
 ## Важно
 
