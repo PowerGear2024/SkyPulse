@@ -1,0 +1,37 @@
+# Секреты — никогда не коммитить
+.env
+
+# Telegram user sessions
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# База данных и логи
+data/
+*.db
+*.sqlite3
+*.log
+logs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
