@@ -16,6 +16,7 @@ from bot.database import Database
 from bot.handlers import register_handlers
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMService
+from bot.services.proactive import proactive_loop
 from bot.telegram_client import build_client, setup_logging
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,8 @@ async def run_userbot() -> None:
     llm = LLMService(settings)
     gate = ChatGate(min_interval_sec=2.0)
     client = build_client(settings)
+    stop_event = asyncio.Event()
+    proactive_task: asyncio.Task | None = None
 
     await db.connect()
 
@@ -63,10 +66,24 @@ async def run_userbot() -> None:
             me=me,
         )
 
+        proactive_task = asyncio.create_task(
+            proactive_loop(
+                client,
+                db=db,
+                llm=llm,
+                settings=settings,
+                gate=gate,
+                me=me,
+                stop_event=stop_event,
+            ),
+            name="proactive-loop",
+        )
+
         logger.info(
-            "User-сессия как %s (id=%s). Режим: ТОЛЬКО группы, ЛС игнор.",
+            "User-сессия как %s (id=%s). Группы: mention/reply + реакции + проактив≤%s/день. ЛС игнор.",
             getattr(me, "username", None) or me.first_name,
             me.id,
+            settings.proactive_max_per_day,
         )
         await client.run_until_disconnected()
     except Exception:
@@ -75,6 +92,15 @@ async def run_userbot() -> None:
         raise
     finally:
         logger.info("Остановка…")
+        stop_event.set()
+        if proactive_task is not None:
+            proactive_task.cancel()
+            try:
+                await proactive_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Ошибка при остановке proactive")
         try:
             await llm.close()
         except Exception:

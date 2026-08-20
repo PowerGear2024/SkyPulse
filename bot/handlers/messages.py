@@ -2,7 +2,8 @@
 Только ГРУППЫ / супергруппы. Личные сообщения — полный игнор.
 
 - Пишет в память все тексты чата (кроме служебных команд).
-- Отвечает по GROUP_REPLY_MODE (all | mention).
+- Отвечает по умолчанию только на @упоминание / reply на своё сообщение
+  (GROUP_REPLY_MODE=mention). Режим all — опционально.
 - Печатает как человек: typing в шапке + задержка от длины ответа.
 """
 
@@ -22,12 +23,11 @@ from bot.handlers.helpers import (
     display_name,
     ensure_user_from_sender,
     safe_reply,
-    split_message,
 )
 from bot.persona import RESET_TEXT, get_start_text
 from bot.services.gate import ChatGate
-from bot.services.llm import LLMError, LLMService
-from bot.services.typing import generate_with_human_typing, human_pause_typing
+from bot.services.llm import LLMService
+from bot.services.responder import generate_and_send
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ def _is_command(text: str, name: str) -> bool:
     return base == f"/{name}"
 
 
-def register_handlers(
+def register_message_handlers(
     client: TelegramClient,
     *,
     db: Database,
@@ -51,7 +51,7 @@ def register_handlers(
     gate: ChatGate,
     me: User,
 ) -> None:
-    """Подписать обработчики. `me` — наш аккаунт (для mention/reply)."""
+    """Подписать обработчики NewMessage. `me` — наш аккаунт."""
 
     @client.on(events.NewMessage(incoming=True))
     async def on_incoming(event: events.NewMessage.Event) -> None:
@@ -113,19 +113,20 @@ def register_handlers(
         if not settings.is_user_allowed(int(sender.id)):
             return
 
+        # По умолчанию — только отметка / reply на наше сообщение
         if settings.group_reply_mode == "mention":
             if not await _is_addressed_to_me(event, me, text):
                 return
 
-        await _reply_in_group(
-            event,
-            client=client,
+        await generate_and_send(
+            client,
             db=db,
             llm=llm,
             settings=settings,
             gate=gate,
             chat_id=chat_id,
             my_id=int(me.id),
+            reply_to=event.message.id if event.message else None,
         )
 
 
@@ -157,64 +158,3 @@ async def _cmd_reset(event: Any, db: Database, chat_id: int) -> None:
     except Exception:
         logger.exception("Ошибка /reset chat_id=%s", chat_id)
         await safe_reply(event, "Не вышло сбросить память чата. Ещё раз?")
-
-
-async def _reply_in_group(
-    event: Any,
-    *,
-    client: TelegramClient,
-    db: Database,
-    llm: LLMService,
-    settings: Settings,
-    gate: ChatGate,
-    chat_id: int,
-    my_id: int,
-) -> None:
-    if not gate.try_begin(chat_id):
-        return
-
-    try:
-        if gate.seconds_until_allowed(chat_id) > 0:
-            return
-
-        gate.mark_used(chat_id)
-
-        history = await db.get_chat_history_for_llm(
-            chat_id, limit=settings.history_limit
-        )
-
-        async def _produce() -> str:
-            return await llm.generate_reply(history)
-
-        reply = await generate_with_human_typing(client, chat_id, _produce)
-
-        await db.add_chat_message(
-            chat_id,
-            reply,
-            sender_id=my_id,
-            sender_name=None,
-            is_me=True,
-            keep=settings.history_limit,
-        )
-
-        chunks = split_message(reply)
-        for i, chunk in enumerate(chunks):
-            if i > 0:
-                await human_pause_typing(client, chat_id, chunk)
-            if not await safe_reply(event, chunk):
-                break
-
-    except LLMError:
-        logger.warning("Сбой генерации chat_id=%s", chat_id)
-        await safe_reply(
-            event,
-            "Блин, мысль оборвалась / инет моргнул. Напиши ещё раз чуть позже.",
-        )
-    except Exception:
-        logger.exception("Ошибка ответа в группе chat_id=%s", chat_id)
-        await safe_reply(
-            event,
-            "Что-то у меня в голове щёлкнуло не так. Кинь /reset или повтори.",
-        )
-    finally:
-        gate.end(chat_id)

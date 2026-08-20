@@ -30,6 +30,11 @@ class Settings:
     allowed_chat_ids: frozenset[int]
     allowed_user_ids: frozenset[int]
     group_reply_mode: str
+    reply_on_reactions: bool
+    proactive_enabled: bool
+    proactive_max_per_day: int
+    proactive_check_sec: int
+    proactive_chance: float
     llm_provider: str
     openai_api_key: str
     anthropic_api_key: str
@@ -136,9 +141,45 @@ def load_settings() -> Settings:
     allowed_chat_ids = _parse_chat_ids(_optional("ALLOWED_CHAT_IDS"))
     allowed_user_ids = _parse_user_ids(_optional("ALLOWED_USER_IDS"))
 
-    group_reply_mode = _optional("GROUP_REPLY_MODE", "all").lower()
+    # По умолчанию — только @упоминание / reply на наше сообщение.
+    # Реакции и проактив — отдельные флаги ниже.
+    group_reply_mode = _optional("GROUP_REPLY_MODE", "mention").lower()
     if group_reply_mode not in {"all", "mention"}:
         raise ValueError("GROUP_REPLY_MODE: 'all' или 'mention'")
+
+    reply_on_reactions = _optional("REPLY_ON_REACTIONS", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    proactive_enabled = _optional("PROACTIVE_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    try:
+        proactive_max_per_day = int(_optional("PROACTIVE_MAX_PER_DAY", "5"))
+    except ValueError as exc:
+        raise ValueError("PROACTIVE_MAX_PER_DAY должна быть целым числом") from exc
+    if proactive_max_per_day < 0 or proactive_max_per_day > 50:
+        raise ValueError("PROACTIVE_MAX_PER_DAY: 0–50")
+
+    try:
+        proactive_check_sec = int(_optional("PROACTIVE_CHECK_SEC", "1800"))
+    except ValueError as exc:
+        raise ValueError("PROACTIVE_CHECK_SEC должна быть целым числом") from exc
+    if proactive_check_sec < 60:
+        raise ValueError("PROACTIVE_CHECK_SEC должна быть >= 60")
+
+    try:
+        proactive_chance = float(_optional("PROACTIVE_CHANCE", "0.35"))
+    except ValueError as exc:
+        raise ValueError("PROACTIVE_CHANCE должна быть числом") from exc
+    if not 0.0 <= proactive_chance <= 1.0:
+        raise ValueError("PROACTIVE_CHANCE: 0.0–1.0")
 
     llm_provider = _optional("LLM_PROVIDER", "openai").lower()
     if llm_provider not in {"openai", "anthropic"}:
@@ -196,6 +237,11 @@ def load_settings() -> Settings:
         allowed_chat_ids=allowed_chat_ids,
         allowed_user_ids=allowed_user_ids,
         group_reply_mode=group_reply_mode,
+        reply_on_reactions=reply_on_reactions,
+        proactive_enabled=proactive_enabled,
+        proactive_max_per_day=proactive_max_per_day,
+        proactive_check_sec=proactive_check_sec,
+        proactive_chance=proactive_chance,
         llm_provider=llm_provider,
         openai_api_key=openai_api_key,
         anthropic_api_key=anthropic_api_key,
@@ -209,8 +255,12 @@ def load_settings() -> Settings:
     )
 
     logger.info(
-        "Конфиг: groups-only, reply=%s, chats=%s, users=%s, history=%s",
+        "Конфиг: groups-only, reply=%s, reactions=%s, proactive=%s/%s/day, "
+        "chats=%s, users=%s, history=%s",
         settings.group_reply_mode,
+        settings.reply_on_reactions,
+        settings.proactive_enabled,
+        settings.proactive_max_per_day,
         len(settings.allowed_chat_ids) or "ALL",
         len(settings.allowed_user_ids) or "ALL",
         settings.history_limit,

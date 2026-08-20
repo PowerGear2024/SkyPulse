@@ -11,7 +11,7 @@ from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
 from bot.config import Settings
-from bot.persona import get_system_prompt
+from bot.persona import get_proactive_prompt, get_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,47 @@ class LLMService:
             logger.exception("Неожиданная ошибка LLM")
             raise LLMError("Провайдер LLM временно недоступен") from exc
 
-    async def _call_openai(self, messages: list[dict[str, str]]) -> str:
+    async def generate_proactive(
+        self,
+        *,
+        user_name: str,
+        messages: list[str],
+    ) -> str:
+        """Короткий живой коммент по теме последних смс пользователя."""
+        if not messages:
+            raise LLMError("Нет сообщений для проактивного анализа")
+        bullet = "\n".join(f"- {m.strip()}" for m in messages if m and m.strip())
+        if not bullet:
+            raise LLMError("Пустые сообщения для проактивного анализа")
+
+        user_prompt = (
+            f"В групповом чате есть человек {user_name}. "
+            f"Вот его последние сообщения:\n{bullet}\n\n"
+            f"Напиши ОДНО короткое сообщение в чат по общей теме / вайбу этих смс. "
+            f"Можно мягко обратиться к {user_name}, но без допроса и без «я проанализировал». "
+            f"Как будто сам вспомнил тему и вкинул мысль. 1–4 предложения."
+        )
+        api_messages = [{"role": "user", "content": user_prompt}]
+        try:
+            if self._settings.llm_provider == "openai":
+                return await self._call_openai(
+                    api_messages, system=get_proactive_prompt()
+                )
+            return await self._call_anthropic(
+                api_messages, system=get_proactive_prompt()
+            )
+        except LLMError:
+            raise
+        except Exception as exc:
+            logger.exception("Неожиданная ошибка LLM (proactive)")
+            raise LLMError("Провайдер LLM временно недоступен") from exc
+
+    async def _call_openai(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        system: str | None = None,
+    ) -> str:
         if self._openai is None:
             raise LLMError("OpenAI-клиент не инициализирован")
         try:
@@ -94,7 +134,7 @@ class LLMService:
                 model=self._settings.openai_model,
                 temperature=self._settings.llm_temperature,
                 messages=[
-                    {"role": "system", "content": get_system_prompt()},
+                    {"role": "system", "content": system or get_system_prompt()},
                     *messages,
                 ],
             )
@@ -107,7 +147,12 @@ class LLMService:
             raise LLMError("OpenAI вернул пустой ответ")
         return choice.strip()
 
-    async def _call_anthropic(self, messages: list[dict[str, str]]) -> str:
+    async def _call_anthropic(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        system: str | None = None,
+    ) -> str:
         if self._anthropic is None:
             raise LLMError("Anthropic-клиент не инициализирован")
         try:
@@ -115,7 +160,7 @@ class LLMService:
                 model=self._settings.anthropic_model,
                 max_tokens=4096,
                 temperature=self._settings.llm_temperature,
-                system=get_system_prompt(),
+                system=system or get_system_prompt(),
                 messages=messages,
             )
         except Exception as exc:

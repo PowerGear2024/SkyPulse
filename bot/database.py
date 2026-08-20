@@ -87,6 +87,20 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id
                 ON chat_messages (chat_id, id);
+
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_sender
+                ON chat_messages (chat_id, sender_id, id);
+
+            -- Проактивные посты (лимит в сутки)
+            CREATE TABLE IF NOT EXISTS proactive_posts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id         INTEGER NOT NULL,
+                target_user_id  INTEGER NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_proactive_posts_day
+                ON proactive_posts (created_at);
             """
         )
         await self.connection.commit()
@@ -270,5 +284,154 @@ class Database:
         except aiosqlite.Error:
             logger.exception(
                 "Ошибка clear_chat_history chat_id=%s", chat_id
+            )
+            raise
+
+    async def count_proactive_today(self) -> int:
+        """Сколько проактивных постов за сегодня (UTC, datetime('now'))."""
+        try:
+            cursor = await self.connection.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM proactive_posts
+                WHERE date(created_at) = date('now')
+                """
+            )
+            row = await cursor.fetchone()
+            return int(row["c"]) if row else 0
+        except aiosqlite.Error:
+            logger.exception("Ошибка count_proactive_today")
+            raise
+
+    async def record_proactive(self, chat_id: int, target_user_id: int) -> None:
+        try:
+            await self.connection.execute(
+                """
+                INSERT INTO proactive_posts (chat_id, target_user_id)
+                VALUES (?, ?)
+                """,
+                (chat_id, target_user_id),
+            )
+            await self.connection.commit()
+        except aiosqlite.Error:
+            logger.exception(
+                "Ошибка record_proactive chat_id=%s user=%s",
+                chat_id,
+                target_user_id,
+            )
+            raise
+
+    async def list_active_chat_ids(self) -> list[int]:
+        """Чаты, где уже есть сообщения в памяти."""
+        try:
+            cursor = await self.connection.execute(
+                """
+                SELECT DISTINCT chat_id
+                FROM chat_messages
+                ORDER BY chat_id
+                """
+            )
+            rows = await cursor.fetchall()
+            return [int(r["chat_id"]) for r in rows]
+        except aiosqlite.Error:
+            logger.exception("Ошибка list_active_chat_ids")
+            raise
+
+    async def list_users_with_min_messages(
+        self,
+        chat_id: int,
+        *,
+        min_count: int = 10,
+        exclude_sender_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Пользователи чата с ≥ min_count своих сообщений.
+        Возвращает [{sender_id, sender_name, msg_count}, ...]
+        """
+        if min_count < 1:
+            return []
+        try:
+            if exclude_sender_id is None:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT sender_id,
+                           MAX(sender_name) AS sender_name,
+                           COUNT(*) AS msg_count
+                    FROM chat_messages
+                    WHERE chat_id = ?
+                      AND is_me = 0
+                      AND sender_id IS NOT NULL
+                    GROUP BY sender_id
+                    HAVING COUNT(*) >= ?
+                    ORDER BY msg_count DESC
+                    """,
+                    (chat_id, min_count),
+                )
+            else:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT sender_id,
+                           MAX(sender_name) AS sender_name,
+                           COUNT(*) AS msg_count
+                    FROM chat_messages
+                    WHERE chat_id = ?
+                      AND is_me = 0
+                      AND sender_id IS NOT NULL
+                      AND sender_id != ?
+                    GROUP BY sender_id
+                    HAVING COUNT(*) >= ?
+                    ORDER BY msg_count DESC
+                    """,
+                    (chat_id, exclude_sender_id, min_count),
+                )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "sender_id": int(r["sender_id"]),
+                    "sender_name": (r["sender_name"] or "Кто-то").strip()
+                    or "Кто-то",
+                    "msg_count": int(r["msg_count"]),
+                }
+                for r in rows
+            ]
+        except aiosqlite.Error:
+            logger.exception(
+                "Ошибка list_users_with_min_messages chat_id=%s", chat_id
+            )
+            raise
+
+    async def get_user_recent_texts(
+        self,
+        chat_id: int,
+        sender_id: int,
+        limit: int = 10,
+    ) -> list[str]:
+        """Последние `limit` текстов конкретного пользователя (хронологически)."""
+        if limit < 1:
+            return []
+        try:
+            cursor = await self.connection.execute(
+                """
+                SELECT content
+                FROM (
+                    SELECT content, id
+                    FROM chat_messages
+                    WHERE chat_id = ?
+                      AND sender_id = ?
+                      AND is_me = 0
+                    ORDER BY id DESC
+                    LIMIT ?
+                ) AS recent
+                ORDER BY id ASC
+                """,
+                (chat_id, sender_id, limit),
+            )
+            rows = await cursor.fetchall()
+            return [str(r["content"]) for r in rows]
+        except aiosqlite.Error:
+            logger.exception(
+                "Ошибка get_user_recent_texts chat_id=%s sender=%s",
+                chat_id,
+                sender_id,
             )
             raise
