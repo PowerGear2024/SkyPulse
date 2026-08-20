@@ -30,6 +30,10 @@ class ChatGate:
         self._inflight.add(chat_id)
         return True
 
+    def is_busy(self, chat_id: int) -> bool:
+        """Чат занят ответом или ещё в rate-limit."""
+        return chat_id in self._inflight or self.seconds_until_allowed(chat_id) > 0
+
     def end(self, chat_id: int) -> None:
         self._inflight.discard(chat_id)
 

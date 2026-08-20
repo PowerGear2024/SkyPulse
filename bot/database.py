@@ -124,6 +124,12 @@ class Database:
         )
         await self.connection.commit()
 
+    async def _rollback_quiet(self) -> None:
+        try:
+            await self.connection.rollback()
+        except aiosqlite.Error:
+            logger.exception("Не удалось откатить транзакцию SQLite")
+
     async def upsert_user(
         self,
         telegram_id: int,
@@ -165,13 +171,13 @@ class Database:
                 await self.connection.commit()
                 return is_new
             except Exception:
-                try:
-                    await self.connection.rollback()
-                except aiosqlite.Error:
-                    logger.exception("Не удалось откатить upsert_user")
+                await self._rollback_quiet()
                 logger.exception(
                     "Ошибка upsert_user для telegram_id=%s", telegram_id
                 )
+                raise
+            except BaseException:
+                await self._rollback_quiet()
                 raise
 
     async def add_chat_message(
@@ -213,13 +219,13 @@ class Database:
                     await self._trim_chat_locked(chat_id, keep)
                 await self.connection.commit()
             except Exception:
-                try:
-                    await self.connection.rollback()
-                except aiosqlite.Error:
-                    logger.exception("Не удалось откатить add_chat_message")
+                await self._rollback_quiet()
                 logger.exception(
                     "Ошибка add_chat_message chat_id=%s", chat_id
                 )
+                raise
+            except BaseException:
+                await self._rollback_quiet()
                 raise
 
     async def get_chat_history_for_llm(
@@ -314,13 +320,13 @@ class Database:
                     self._pulse_epoch[chat_id],
                 )
             except Exception:
-                try:
-                    await self.connection.rollback()
-                except aiosqlite.Error:
-                    logger.exception("Не удалось откатить clear_chat_history")
+                await self._rollback_quiet()
                 logger.exception(
                     "Ошибка clear_chat_history chat_id=%s", chat_id
                 )
+                raise
+            except BaseException:
+                await self._rollback_quiet()
                 raise
 
     def pulse_epoch(self, chat_id: int) -> int:
@@ -371,13 +377,13 @@ class Database:
                     await self._trim_chat_locked(chat_id, keep)
                 await self.connection.commit()
             except Exception:
-                try:
-                    await self.connection.rollback()
-                except aiosqlite.Error:
-                    logger.exception("Не удалось откатить add_chat_messages_batch")
+                await self._rollback_quiet()
                 logger.exception(
                     "Ошибка add_chat_messages_batch chat_id=%s", chat_id
                 )
+                raise
+            except BaseException:
+                await self._rollback_quiet()
                 raise
 
     async def get_persona_pulse(self, chat_id: int) -> dict[str, Any]:
@@ -498,13 +504,13 @@ class Database:
                 await self.connection.commit()
                 return True
             except Exception:
-                try:
-                    await self.connection.rollback()
-                except aiosqlite.Error:
-                    logger.exception("Не удалось откатить save_persona_pulse")
+                await self._rollback_quiet()
                 logger.exception(
                     "Ошибка save_persona_pulse chat_id=%s", chat_id
                 )
+                raise
+            except BaseException:
+                await self._rollback_quiet()
                 raise
 
     async def count_proactive_since(self, since_utc: str) -> int:
@@ -565,13 +571,13 @@ class Database:
                 await self.connection.commit()
                 return int(cursor.lastrowid) if cursor.lastrowid else None
             except Exception:
-                try:
-                    await self.connection.rollback()
-                except aiosqlite.Error:
-                    logger.exception("Не удалось откатить try_reserve_proactive")
+                await self._rollback_quiet()
                 logger.exception(
                     "Ошибка try_reserve_proactive chat_id=%s", chat_id
                 )
+                raise
+            except BaseException:
+                await self._rollback_quiet()
                 raise
 
     async def release_proactive(self, reservation_id: int) -> None:

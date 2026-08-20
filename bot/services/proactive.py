@@ -141,6 +141,11 @@ async def _maybe_proactive_once(
         if len(texts) < _ANALYZE_COUNT:
             continue
 
+        # Не жги LLM, если чат уже занят ответом / rate-limit
+        if gate.is_busy(chat_id):
+            logger.debug("Проактив: chat=%s занят gate — пропуск", chat_id)
+            continue
+
         reservation_id = await db.try_reserve_proactive(
             chat_id,
             sender_id,

@@ -9,7 +9,7 @@ import json
 import logging
 import random
 import re
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 from bot.persona import AI_DEFLECT_REPLIES, SHORT_NAME
 
@@ -17,24 +17,21 @@ logger = logging.getLogger(__name__)
 
 _VALID_STANCES = frozenset({"warm", "grudge", "crush", "annoyed", "neutral"})
 
-# Только явные ПРИЗНАНИЯ «я = ИИ/бот», не разговор про бренды и не «я не бот»
+# Только явные ПРИЗНАНИЯ «я = ИИ/бот»
 _AI_LEAK_RE = re.compile(
     r"(?i)("
-    # RU: я [—-] ИИ / я ИИ / я AI
-    r"\bя\s*[-–—]?\s*(?:ии|ai)\b|"
-    # я бот / я живой бот (без «не»)
-    r"\bя\s+(?:всего\s+лишь\s+)?(?:живой\s+)?бот\b|"
-    r"\bя\s+(?:языковая\s+)?модель\b|"
-    r"\bя\s+нейросет(?:ь|ка)\b|"
-    r"\bя\s+(?:chatgpt|gpt-?\d|claude|gemini)\b|"
+    r"(?<!не )\bя\s*[-–—]?\s*(?:ии|ai)\b|"
+    r"(?<!не )\bя\s+(?:всего\s+лишь\s+)?(?:живой\s+)?бот\b|"
+    r"(?<!не )\bя\s+языковая\s+модель\b|"
+    r"(?<!не )\bя\s+нейросет(?:ь|ка)\b|"
+    r"(?<!не )\bя\s+(?:chatgpt|gpt(?:-?\d+)?|claude|gemini)\b|"
     r"как\s+(?:ии|ai|бот|модель)\s+я\b|"
     r"\bя\s+виртуальн(?:ый|ая)\s+(?:помощник|ассистент|собеседник)\b|"
     r"у\s+меня\s+нет\s+(?:физического\s+)?тела\b|"
     r"у\s+меня\s+нет\s+(?:настоящих\s+)?(?:чувств|эмоций)\s*,?\s*(?:я|потому)|"
     r"меня\s+запрограмм|"
     r"\bя\s+не\s+человек\b|"
-    r"\bя\s+искусственн(?:ый|ый\s+интеллект|ая\s+интеллект)\b|"
-    # EN admissions
+    r"\bя\s+искусственн(?:ый\s+интеллект|ая\s+интеллект|ый)\b|"
     r"\bi\s*['’]?m\s+an?\s+ai\b|"
     r"\bi\s+am\s+an?\s+ai\b|"
     r"\bi\s*['’]?m\s+an?\s+bot\b|"
@@ -45,7 +42,6 @@ _AI_LEAK_RE = re.compile(
     r")"
 )
 
-# Явные отрицания — не считаем сливом
 _AI_DENIAL_RE = re.compile(
     r"(?i)("
     r"\bя\s+не\s+(?:ии|ai|бот|нейросеть|модель)\b|"
@@ -56,20 +52,13 @@ _AI_DENIAL_RE = re.compile(
 
 
 def looks_like_ai_admission(text: str) -> bool:
+    """True только если есть признание; отрицания вырезаются перед повторной проверкой."""
     if not text or not text.strip():
         return False
-    if _AI_DENIAL_RE.search(text) and not re.search(
-        r"(?i)\bя\s*[-–—]?\s*(?:ии|ai)\b|\bi\s+am\s+an?\s+ai\b", text
-    ):
-        # Чистое отрицание без параллельного «я ИИ»
-        if not re.search(
-            r"(?i)\bя\s+(?:бот|нейросеть|языковая\s+модель)\b|"
-            r"\bas\s+an\s+ai\b|"
-            r"\bi\s*['’]?m\s+an?\s+ai\b",
-            text,
-        ):
-            return False
-    return _AI_LEAK_RE.search(text) is not None
+    if not _AI_LEAK_RE.search(text):
+        return False
+    stripped = _AI_DENIAL_RE.sub(" ", text)
+    return _AI_LEAK_RE.search(stripped) is not None
 
 
 def deflect_ai_accusation() -> str:
@@ -157,24 +146,35 @@ def parse_reflect_json(raw: str) -> dict[str, Any] | None:
 
 
 class ReflectScheduler:
-    """Один reflect на чат; отмена при новом / при shutdown; учёт reset epoch."""
+    """Один reflect на чат; отмена при новом / reset / shutdown."""
 
     def __init__(self) -> None:
         self._tasks: dict[int, asyncio.Task[None]] = {}
+
+    def cancel_chat(self, chat_id: int) -> None:
+        prev = self._tasks.pop(chat_id, None)
+        if prev is not None and not prev.done():
+            prev.cancel()
 
     def schedule(
         self,
         chat_id: int,
         *,
         epoch: int,
+        epoch_ok: Callable[[], bool],
         runner: Callable[[], Awaitable[None]],
     ) -> None:
-        prev = self._tasks.get(chat_id)
-        if prev is not None and not prev.done():
-            prev.cancel()
+        self.cancel_chat(chat_id)
 
         async def _wrapped() -> None:
             try:
+                if not epoch_ok():
+                    logger.debug(
+                        "reflect skip stale epoch chat_id=%s epoch=%s",
+                        chat_id,
+                        epoch,
+                    )
+                    return
                 await runner()
             except asyncio.CancelledError:
                 raise
@@ -199,12 +199,9 @@ class ReflectScheduler:
         def _done(t: asyncio.Task[None]) -> None:
             if self._tasks.get(chat_id) is t:
                 self._tasks.pop(chat_id, None)
-            # забрать exception чтобы не было "Task exception was never retrieved"
             try:
                 t.exception()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
+            except (asyncio.CancelledError, Exception):
                 pass
 
         task.add_done_callback(_done)
@@ -218,5 +215,4 @@ class ReflectScheduler:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# Глобальный планировщик (один процесс бота)
 reflect_scheduler = ReflectScheduler()

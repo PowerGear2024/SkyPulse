@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -50,15 +51,23 @@ def _schedule_reflect(
         )
         if not data:
             return
-        await db.save_persona_pulse(
-            chat_id,
-            mood=str(data.get("mood") or "дерзкий"),
-            vibe=str(data.get("vibe") or ""),
-            feelings=list(data.get("feelings") or []),
-            expected_epoch=epoch,
+        # shield: cancel reflect не должен рвать открытый BEGIN
+        await asyncio.shield(
+            db.save_persona_pulse(
+                chat_id,
+                mood=str(data.get("mood") or "дерзкий"),
+                vibe=str(data.get("vibe") or ""),
+                feelings=list(data.get("feelings") or []),
+                expected_epoch=epoch,
+            )
         )
 
-    reflect_scheduler.schedule(chat_id, epoch=epoch, runner=_run)
+    reflect_scheduler.schedule(
+        chat_id,
+        epoch=epoch,
+        epoch_ok=lambda: db.pulse_epoch(chat_id) == epoch,
+        runner=_run,
+    )
 
 
 async def generate_and_send(
@@ -204,7 +213,7 @@ async def send_prepared(
     client: TelegramClient,
     *,
     db: Database,
-    llm: LLMService | None = None,
+    llm: LLMService,
     settings: Settings,
     gate: ChatGate,
     guard: OwnerGuard,
@@ -231,6 +240,11 @@ async def send_prepared(
             return False
         if gate.seconds_until_allowed(chat_id) > 0:
             return False
+
+        # История для reflect — до записи ответа (без дубля)
+        history_for_reflect = await db.get_chat_history_for_llm(
+            chat_id, limit=min(12, settings.history_limit)
+        )
 
         async def _produce() -> str:
             return text.strip()
@@ -274,11 +288,9 @@ async def send_prepared(
                     "Не удалось сохранить proactive в память chat_id=%s",
                     chat_id,
                 )
-            if llm is not None:
-                history = await db.get_chat_history_for_llm(
-                    chat_id, limit=min(12, settings.history_limit)
-                )
-                _schedule_reflect(llm, db, chat_id, history, full_reply)
+            _schedule_reflect(
+                llm, db, chat_id, history_for_reflect, full_reply
+            )
         return sent_any
     except Exception:
         logger.exception("Ошибка send_prepared chat_id=%s", chat_id)

@@ -24,6 +24,7 @@ from bot.handlers.helpers import (
     safe_reply,
 )
 from bot.persona import RESET_TEXT, get_start_text
+from bot.services.emotions import reflect_scheduler
 from bot.services.gate import ChatGate
 from bot.services.llm import LLMService
 from bot.services.presence import OwnerGuard
@@ -168,6 +169,7 @@ async def _cmd_reset(
     event: Any, db: Database, chat_id: int, *, guard: OwnerGuard
 ) -> None:
     try:
+        reflect_scheduler.cancel_chat(chat_id)
         await db.clear_chat_history(chat_id)
         await safe_reply(event, RESET_TEXT, guard=guard)
     except Exception:

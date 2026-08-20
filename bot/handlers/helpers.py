@@ -11,20 +11,17 @@ from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.types import User
 
 from bot.database import Database
-from bot.textutil import TELEGRAM_MESSAGE_LIMIT, split_message
 
 logger = logging.getLogger(__name__)
 
 MAX_USER_CHARS = 4000
 
 __all__ = [
-    "TELEGRAM_MESSAGE_LIMIT",
     "MAX_USER_CHARS",
     "as_telegram_user",
     "memory_sender_info",
     "display_name",
     "ensure_user_from_sender",
-    "split_message",
     "safe_reply",
 ]
 
@@ -85,7 +82,11 @@ async def safe_reply(event: Any, text: str, *, guard: Any | None = None) -> bool
     try:
         if guard is not None:
             with guard.bot_outbound():
-                await event.respond(text)
+                msg = await event.respond(text)
+            chat_id = getattr(event, "chat_id", None)
+            msg_id = getattr(msg, "id", None)
+            if chat_id is not None and msg_id is not None:
+                guard.note_bot_message(int(chat_id), int(msg_id))
         else:
             await event.respond(text)
         return True
