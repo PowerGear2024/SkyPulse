@@ -1,4 +1,4 @@
-"""Позволяет запускать бота командой: python -m bot"""
+"""Позволяет запускать: python -m bot"""
 
 from bot.main import main
 
