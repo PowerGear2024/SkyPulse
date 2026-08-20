@@ -7,24 +7,18 @@
 
 ```
 bot/
-  main.py              # точка входа user-сессии
-  login.py             # первый логин + StringSession
-  config.py            # .env
-  persona.py           # ФИО / характер / промпт
-  database.py          # SQLite
-  handlers/
-    messages.py        # входящие ЛС
-    helpers.py
-  services/
-    gate.py            # rate-limit
-    llm.py             # OpenAI / Anthropic
-.env.example
-requirements.txt
+  main.py                 # python -m bot
+  login.py                # python -m bot.login
+  telegram_client.py      # сборка Telethon-клиента
+  config.py               # .env + whitelist
+  persona.py
+  database.py
+  handlers/messages.py
+  services/gate.py
+  services/llm.py
 ```
 
 ## Быстрый старт
-
-### 1. Зависимости
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -32,39 +26,26 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### 2. Ключи Telegram (user API)
-
-1. Зайди на https://my.telegram.org/apps
-2. Создай приложение → скопируй `api_id` и `api_hash` в `.env`:
-
-```env
-TELEGRAM_API_ID=...
-TELEGRAM_API_HASH=...
-TELEGRAM_SESSION_NAME=user
-```
-
-Плюс ключ LLM (`OPENAI_API_KEY` или `ANTHROPIC_API_KEY`).
-
-### 3. Первый логин (один раз)
+В `.env`:
+1. `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` с https://my.telegram.org/apps
+2. Ключ LLM
+3. **Рекомендуется** `ALLOWED_USER_IDS=123456789` — кому отвечать в ЛС
 
 ```bash
-python -m bot.login
-```
-
-Введёшь телефон и код из Telegram. Появится `data/user.session` и
-(опционально) строка `TELEGRAM_SESSION_STRING=...` для `.env`.
-
-### 4. Запуск
-
-```bash
+python -m bot.login   # телефон + код, один раз
 python -m bot
 ```
 
-Пиши ему в личку со другого аккаунта: `/start`, обычный текст, `/reset`.
+## Команды в ЛС
 
-## Важно
+| Текст | Действие |
+|---|---|
+| `/start` | Приветствие + запись в БД |
+| `/reset` | Очистить историю |
+| любой текст | Ответ в образе Дани |
 
-- Это **не бот**, а клиент твоего аккаунта (MTProto / Telethon).
-- Отвечает только на **входящие личные** сообщения (группы и исходящие игнор).
-- Сессию (`*.session` / `TELEGRAM_SESSION_STRING`) храни как пароль.
-- Автоматизация user-аккаунта может нарушать ToS Telegram — используй на свой риск.
+## Безопасность
+
+- `*.session` / `TELEGRAM_SESSION_STRING` = полный доступ к аккаунту, как пароль
+- Пустой `ALLOWED_USER_IDS` = любой человек в ЛС жжёт твой LLM-бюджет
+- Автоматизация user-аккаунта может нарушать ToS Telegram

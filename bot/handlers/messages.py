@@ -7,12 +7,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from telethon import events
+from telethon import TelegramClient, events
 
 from bot.config import Settings
 from bot.database import Database
 from bot.handlers.helpers import (
     MAX_USER_CHARS,
+    as_telegram_user,
     ensure_user_from_sender,
     safe_reply,
     split_message,
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def register_handlers(
-    client: Any,
+    client: TelegramClient,
     *,
     db: Database,
     llm: LLMService,
@@ -36,21 +37,26 @@ def register_handlers(
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def on_private_message(event: events.NewMessage.Event) -> None:
-        """Только входящие ЛС (не группы, не свои исходящие)."""
-        if not event.message or not event.message.message:
+        """Только входящие ЛС (не группы, не исходящие)."""
+        raw = event.message.message if event.message else None
+        if not raw:
             return
 
-        text = event.message.message.strip()
+        text = raw.strip()
         if not text:
             return
 
-        sender = await event.get_sender()
-        if sender is None or getattr(sender, "bot", False):
+        sender = as_telegram_user(await event.get_sender())
+        if sender is None:
             return
 
         user_id = int(sender.id)
 
-        # Команды
+        # Whitelist: защита бюджета LLM от случайных/враждебных ЛС
+        if not settings.is_user_allowed(user_id):
+            logger.info("Игнор ЛС от user_id=%s (нет в ALLOWED_USER_IDS)", user_id)
+            return
+
         lowered = text.lower()
         if lowered.startswith("/start"):
             await _cmd_start(event, db, sender)
@@ -59,7 +65,6 @@ def register_handlers(
             await _cmd_reset(event, db, user_id)
             return
         if text.startswith("/"):
-            # Чужие слэш-команды игнорим молча
             return
 
         await _handle_chat(
@@ -99,7 +104,7 @@ async def _cmd_reset(event: Any, db: Database, user_id: int) -> None:
 async def _handle_chat(
     event: Any,
     *,
-    client: Any,
+    client: TelegramClient,
     db: Database,
     llm: LLMService,
     settings: Settings,
@@ -131,12 +136,23 @@ async def _handle_chat(
         await ensure_user_from_sender(db, sender)
         history = await db.get_history(user_id, limit=settings.history_limit)
 
-        # «Печатает…» пока ждём LLM
-        async with client.action(event.chat_id, "typing"):
-            reply = await llm.generate_reply(
-                history=history,
-                user_message=user_text,
-            )
+        reply: str | None = None
+        try:
+            async with client.action(event.chat_id, "typing"):
+                reply = await llm.generate_reply(
+                    history=history,
+                    user_message=user_text,
+                )
+        except LLMError:
+            raise
+        except Exception:
+            # Упал сам typing-индикатор — генерим без него (без повторного вызова, если ответ уже есть)
+            logger.debug("typing action failed user_id=%s", user_id, exc_info=True)
+            if reply is None:
+                reply = await llm.generate_reply(
+                    history=history,
+                    user_message=user_text,
+                )
 
         await db.add_exchange(
             user_id,

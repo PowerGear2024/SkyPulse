@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from telethon.errors import FloodWaitError, RPCError
+from telethon.tl.types import User
 
 from bot.database import Database
 
@@ -17,18 +18,31 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 MAX_USER_CHARS = 4000
 
 
-async def ensure_user_from_sender(db: Database, sender: Any) -> bool:
-    """Записать/обновить собеседника по объекту Telethon User."""
+def as_telegram_user(sender: Any) -> User | None:
+    """Вернуть User или None, если отправитель не человек-аккаунт."""
+    if sender is None or not isinstance(sender, User):
+        return None
+    if getattr(sender, "bot", False) or getattr(sender, "deleted", False):
+        return None
+    if not getattr(sender, "id", None):
+        return None
+    return sender
+
+
+async def ensure_user_from_sender(db: Database, sender: User) -> bool:
+    """Записать/обновить собеседника."""
     return await db.upsert_user(
         telegram_id=int(sender.id),
-        username=getattr(sender, "username", None),
-        first_name=getattr(sender, "first_name", None),
-        last_name=getattr(sender, "last_name", None),
+        username=sender.username,
+        first_name=sender.first_name,
+        last_name=sender.last_name,
     )
 
 
 def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     """Разбить длинный ответ под лимит Telegram."""
+    if limit < 1:
+        raise ValueError("split_message: limit должен быть >= 1")
     if len(text) <= limit:
         return [text]
 
@@ -48,6 +62,8 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
 
 async def safe_reply(event: Any, text: str) -> bool:
     """Ответить в тот же чат, глотая типовые RPC-ошибки."""
+    if not text:
+        return False
     try:
         await event.respond(text)
         return True

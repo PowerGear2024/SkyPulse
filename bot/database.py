@@ -4,6 +4,8 @@
 Хранит:
   - пользователей (telegram_id + метаданные);
   - историю диалога (последние N реплик на пользователя).
+
+Все запросы параметризованы — SQL-инъекции через контент исключены.
 """
 
 from __future__ import annotations
@@ -16,14 +18,12 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-# Жёсткие потолки под лимиты Telegram (защита от раздувания БД)
 _MAX_USERNAME_LEN = 64
 _MAX_NAME_LEN = 128
 _MAX_CONTENT_LEN = 4096
 
 
 def _clip(value: str | None, max_len: int) -> str | None:
-    """Обрезать строку до max_len; None остаётся None."""
     if value is None:
         return None
     return value[:max_len]
@@ -45,26 +45,26 @@ class Database:
         return self._connection
 
     async def connect(self) -> None:
-        """Открыть соединение и создать таблицы, если их ещё нет."""
+        """Открыть соединение и создать таблицы (идемпотентно)."""
         if self._connection is not None:
             return
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = await aiosqlite.connect(self._db_path)
+        self._connection = await aiosqlite.connect(self._db_path, timeout=30.0)
         self._connection.row_factory = aiosqlite.Row
         await self._connection.execute("PRAGMA foreign_keys = ON;")
         await self._connection.execute("PRAGMA journal_mode = WAL;")
+        await self._connection.execute("PRAGMA busy_timeout = 30000;")
         await self._create_tables()
         logger.info("SQLite подключена: %s", self._db_path)
 
     async def close(self) -> None:
-        """Корректно закрыть соединение (идемпотентно)."""
+        """Закрыть соединение (идемпотентно)."""
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
             logger.info("Соединение с SQLite закрыто")
 
     async def _create_tables(self) -> None:
-        """Схема БД: пользователи + сообщения чата."""
         await self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -100,18 +100,20 @@ class Database:
         last_name: str | None = None,
     ) -> bool:
         """
-        Сохранить или обновить пользователя атомарно.
+        Сохранить или обновить пользователя в одной транзакции.
 
         Returns:
-            True, если пользователь новый; False, если уже был в БД.
+            True, если пользователь новый.
         """
+        if telegram_id <= 0:
+            raise ValueError(f"Некорректный telegram_id: {telegram_id}")
+
         username = _clip(username, _MAX_USERNAME_LEN)
         first_name = _clip(first_name, _MAX_NAME_LEN)
         last_name = _clip(last_name, _MAX_NAME_LEN)
 
         try:
-            # Атомарно: INSERT OR IGNORE → rowcount=1 только для нового юзера.
-            # Потом, если уже был — отдельный UPDATE профиля.
+            await self.connection.execute("BEGIN")
             cursor = await self.connection.execute(
                 """
                 INSERT INTO users (telegram_id, username, first_name, last_name)
@@ -142,7 +144,11 @@ class Database:
                     "Новый пользователь: id=%s username=%s", telegram_id, username
                 )
             return is_new
-        except aiosqlite.Error:
+        except Exception:
+            try:
+                await self.connection.rollback()
+            except aiosqlite.Error:
+                logger.exception("Не удалось откатить upsert_user")
             logger.exception("Ошибка upsert_user для telegram_id=%s", telegram_id)
             raise
 
@@ -154,14 +160,14 @@ class Database:
         *,
         keep: int | None = None,
     ) -> None:
-        """
-        Сохранить пару user/assistant в одной транзакции.
+        """Сохранить пару user/assistant (+ optional trim) в одной транзакции."""
+        user_content = (user_content or "").strip()[:_MAX_CONTENT_LEN]
+        assistant_content = (assistant_content or "").strip()[:_MAX_CONTENT_LEN]
+        if not user_content or not assistant_content:
+            raise ValueError("add_exchange: пустой user/assistant контент")
+        if keep is not None and keep < 2:
+            raise ValueError("add_exchange: keep должен быть >= 2")
 
-        Если передан `keep` — тут же обрезает историю до последних keep
-        сообщений в той же транзакции (не оставляем «хвост» при сбое trim).
-        """
-        user_content = user_content[:_MAX_CONTENT_LEN]
-        assistant_content = assistant_content[:_MAX_CONTENT_LEN]
         try:
             await self.connection.execute("BEGIN")
             await self.connection.execute(
@@ -196,11 +202,9 @@ class Database:
         telegram_id: int,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """
-        Вернуть последние `limit` реплик в хронологическом порядке.
-
-        Формат: [{"role": "user"|"assistant", "content": "..."}, ...]
-        """
+        """Последние `limit` реплик в хронологическом порядке."""
+        if limit < 1:
+            return []
         try:
             cursor = await self.connection.execute(
                 """
@@ -251,7 +255,7 @@ class Database:
         return cursor.rowcount if cursor.rowcount is not None else 0
 
     async def clear_history(self, telegram_id: int) -> None:
-        """Полностью очистить историю диалога пользователя (/reset)."""
+        """Полностью очистить историю диалога (/reset)."""
         try:
             await self.connection.execute(
                 "DELETE FROM messages WHERE telegram_id = ?",

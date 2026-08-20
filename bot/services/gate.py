@@ -18,6 +18,10 @@ class UserGate:
         min_interval_sec: float = 1.5,
         idle_ttl_sec: float = 3600.0,
     ) -> None:
+        if min_interval_sec < 0:
+            raise ValueError("min_interval_sec должен быть >= 0")
+        if idle_ttl_sec < 0:
+            raise ValueError("idle_ttl_sec должен быть >= 0")
         self._min_interval = min_interval_sec
         self._idle_ttl = idle_ttl_sec
         self._inflight: set[int] = set()

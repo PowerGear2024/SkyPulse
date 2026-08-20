@@ -16,7 +16,7 @@ import sys
 from telethon.sessions import StringSession
 
 from bot.config import load_settings
-from bot.main import build_client, setup_logging
+from bot.telegram_client import build_client, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,6 @@ async def _login() -> None:
     setup_logging(settings.log_level)
     settings.session_dir.mkdir(parents=True, exist_ok=True)
 
-    # Если задан SESSION_STRING — логин не нужен; подскажем сразу
     if settings.session_string:
         print(
             "В .env уже есть TELEGRAM_SESSION_STRING — "
@@ -41,21 +40,27 @@ async def _login() -> None:
         return
 
     client = build_client(settings)
-    # Интерактивно спросит телефон и код
-    await client.start()
-    me = await client.get_me()
-    logger.info(
-        "Успешный вход: %s (id=%s)",
-        getattr(me, "username", None) or me.first_name,
-        me.id,
-    )
+    session_string: str | None = None
+    try:
+        await client.start()
+        me = await client.get_me()
+        logger.info(
+            "Успешный вход: %s (id=%s)",
+            getattr(me, "username", None) or me.first_name,
+            me.id,
+        )
+        session_string = StringSession.save(client.session)
+    finally:
+        if client.is_connected():
+            await client.disconnect()
 
-    session_string = StringSession.save(client.session)
-    await client.disconnect()
+    if not session_string:
+        logger.error("Логин не завершён — StringSession не получен")
+        sys.exit(1)
 
     print("\n=== Готово ===")
     print(f"Файловая сессия: {settings.session_path}.session")
-    print("\nОпционально добавь в .env (вместо файла сессии):")
+    print("\nОпционально добавь в .env (храни как пароль!):")
     print(f"TELEGRAM_SESSION_STRING={session_string}")
     print("\nЗапуск: python -m bot\n")
 

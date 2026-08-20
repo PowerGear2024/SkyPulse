@@ -3,7 +3,7 @@
 
 Запуск:
     python -m bot
-Первый логин / StringSession:
+Первый логин:
     python -m bot.login
 """
 
@@ -13,47 +13,14 @@ import asyncio
 import logging
 import sys
 
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-
-from bot.config import Settings, load_settings
+from bot.config import load_settings
 from bot.database import Database
 from bot.handlers import register_handlers
 from bot.services.gate import UserGate
 from bot.services.llm import LLMService
+from bot.telegram_client import build_client, setup_logging
 
 logger = logging.getLogger(__name__)
-
-
-def setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
-        force=True,
-    )
-    logging.getLogger("telethon").setLevel(logging.WARNING)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("openai").setLevel(logging.WARNING)
-    logging.getLogger("anthropic").setLevel(logging.WARNING)
-
-
-def build_client(settings: Settings) -> TelegramClient:
-    """Собрать Telethon-клиент из StringSession или файла сессии."""
-    settings.session_dir.mkdir(parents=True, exist_ok=True)
-
-    if settings.session_string:
-        session: StringSession | str = StringSession(settings.session_string)
-    else:
-        session = str(settings.session_path)
-
-    return TelegramClient(
-        session,
-        settings.telegram_api_id,
-        settings.telegram_api_hash,
-    )
 
 
 async def run_userbot() -> None:
@@ -81,13 +48,15 @@ async def run_userbot() -> None:
         gate=gate,
     )
 
+    exit_code = 0
     try:
         await client.connect()
         if not await client.is_user_authorized():
             logger.error(
                 "Сессия не авторизована. Сначала выполни: python -m bot.login"
             )
-            sys.exit(1)
+            exit_code = 1
+            return
 
         me = await client.get_me()
         logger.info(
@@ -96,6 +65,10 @@ async def run_userbot() -> None:
             me.id,
         )
         await client.run_until_disconnected()
+    except Exception:
+        logger.exception("Критическая ошибка user-сессии")
+        exit_code = 1
+        raise
     finally:
         logger.info("Остановка…")
         try:
@@ -106,8 +79,14 @@ async def run_userbot() -> None:
             await db.close()
         except Exception:
             logger.exception("Ошибка при закрытии БД")
-        if client.is_connected():
-            await client.disconnect()
+        try:
+            if client.is_connected():
+                await client.disconnect()
+        except Exception:
+            logger.exception("Ошибка при disconnect Telethon")
+
+    if exit_code:
+        sys.exit(exit_code)
 
 
 def main() -> None:

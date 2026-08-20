@@ -1,8 +1,7 @@
 """
 Клиент LLM: OpenAI (GPT-4o) или Anthropic (Claude).
 
-Температура по умолчанию 0.85 — живой тон без «бреда».
-История диалога передаётся снаружи (из SQLite).
+Таймаут на запрос обязателен — иначе hang подвесит слот user-gate навсегда.
 """
 
 from __future__ import annotations
@@ -18,6 +17,9 @@ from bot.persona import get_system_prompt
 
 logger = logging.getLogger(__name__)
 
+# Потолок длины одной реплики в контексте (защита RAM/токенов)
+_MAX_HISTORY_MSG_CHARS = 4000
+
 
 class LLMError(Exception):
     """Ошибка при обращении к провайдеру LLM."""
@@ -32,7 +34,8 @@ def normalize_history(
 
     - роли только user/assistant;
     - склеивает подряд идущие реплики одной роли;
-    - убирает ведущие assistant (Anthropic требует начинать с user);
+    - убирает ведущие assistant;
+    - режет слишком длинные куски;
     - текущее сообщение пользователя всегда в конце.
     """
     merged: list[dict[str, str]] = []
@@ -42,18 +45,23 @@ def normalize_history(
         content = (item.get("content") or "").strip()
         if role not in {"user", "assistant"} or not content:
             continue
+        content = content[:_MAX_HISTORY_MSG_CHARS]
         if merged and merged[-1]["role"] == role:
-            merged[-1]["content"] = f"{merged[-1]['content']}\n{content}"
+            combined = f"{merged[-1]['content']}\n{content}"
+            merged[-1]["content"] = combined[:_MAX_HISTORY_MSG_CHARS]
         else:
             merged.append({"role": role, "content": content})
 
     while merged and merged[0]["role"] != "user":
         merged.pop(0)
 
-    user_message = user_message.strip()
+    user_message = user_message.strip()[:_MAX_HISTORY_MSG_CHARS]
+    if not user_message:
+        raise LLMError("Пустое сообщение пользователя")
+
     if merged and merged[-1]["role"] == "user":
-        # Не даём двум user подряд (после trim / гонки) — склеиваем
-        merged[-1]["content"] = f"{merged[-1]['content']}\n{user_message}"
+        combined = f"{merged[-1]['content']}\n{user_message}"
+        merged[-1]["content"] = combined[:_MAX_HISTORY_MSG_CHARS]
     else:
         merged.append({"role": "user", "content": user_message})
 
@@ -67,23 +75,27 @@ class LLMService:
         self._settings = settings
         self._openai: AsyncOpenAI | None = None
         self._anthropic: AsyncAnthropic | None = None
+        timeout = settings.llm_timeout_sec
 
         if settings.llm_provider == "openai":
-            self._openai = AsyncOpenAI(api_key=settings.openai_api_key)
+            self._openai = AsyncOpenAI(
+                api_key=settings.openai_api_key,
+                timeout=timeout,
+                max_retries=2,
+            )
         else:
-            self._anthropic = AsyncAnthropic(api_key=settings.anthropic_api_key)
+            self._anthropic = AsyncAnthropic(
+                api_key=settings.anthropic_api_key,
+                timeout=timeout,
+                max_retries=2,
+            )
 
     async def generate_reply(
         self,
         history: list[dict[str, Any]],
         user_message: str,
     ) -> str:
-        """
-        Сгенерировать ответ ассистента.
-
-        Raises:
-            LLMError: при сетевых/API ошибках провайдера.
-        """
+        """Сгенерировать ответ ассистента."""
         messages = normalize_history(history, user_message)
 
         try:
@@ -97,7 +109,6 @@ class LLMService:
             raise LLMError("Провайдер LLM временно недоступен") from exc
 
     async def _call_openai(self, messages: list[dict[str, str]]) -> str:
-        """Запрос к OpenAI Chat Completions API."""
         if self._openai is None:
             raise LLMError("OpenAI-клиент не инициализирован")
 
@@ -115,12 +126,11 @@ class LLMService:
             raise LLMError("OpenAI API вернул ошибку") from exc
 
         choice = response.choices[0].message.content if response.choices else None
-        if not choice:
+        if not choice or not choice.strip():
             raise LLMError("OpenAI вернул пустой ответ")
         return choice.strip()
 
     async def _call_anthropic(self, messages: list[dict[str, str]]) -> str:
-        """Запрос к Anthropic Messages API."""
         if self._anthropic is None:
             raise LLMError("Anthropic-клиент не инициализирован")
 
@@ -148,7 +158,7 @@ class LLMService:
         return reply
 
     async def close(self) -> None:
-        """Закрыть HTTP-клиенты провайдеров (идемпотентно)."""
+        """Закрыть HTTP-клиенты (идемпотентно)."""
         if self._openai is not None:
             await self._openai.close()
             self._openai = None

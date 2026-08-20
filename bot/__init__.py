@@ -1,3 +1,3 @@
 """
-Пакет бота: конфигурация, БД, LLM-сервис и хендлеры Telegram.
+Пакет: Telegram user-session AI (Telethon).
 """
