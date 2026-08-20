@@ -2,7 +2,7 @@
 Хендлер обычных текстовых сообщений — диалог с LLM.
 
 Флоу:
-  1. Только private-чат, rate-limit + per-user lock
+  1. Только private-чат, rate-limit + per-user слот
   2. Сохранить/обновить пользователя в SQLite
   3. Подтянуть последние N реплик
   4. Спросить LLM
@@ -72,74 +72,64 @@ async def handle_text(
     if len(user_text) > MAX_USER_CHARS:
         user_text = user_text[:MAX_USER_CHARS]
 
-    # Не копим очередь: если уже думаем — сразу отшиваем
-    if gate.is_busy(user.id):
+    if not gate.try_begin(user.id):
         await safe_answer(
             message,
             "Я ещё ковыряюсь с прошлым сообщением — секунду, не долби.",
         )
         return
 
-    wait = gate.seconds_until_allowed(user.id)
-    if wait > 0:
-        await safe_answer(
-            message,
-            f"Эй, притормози на {wait:.1f} сек — я не автомат по спаму.",
-        )
-        return
-
-    async with gate.lock_for(user.id):
+    try:
         wait = gate.seconds_until_allowed(user.id)
         if wait > 0:
             await safe_answer(
                 message,
-                f"Подожди ещё {wait:.1f} сек, я чуть раньше уже отвечал.",
+                f"Эй, притормози на {wait:.1f} сек — я не автомат по спаму.",
             )
             return
 
-        # Сразу ставит кулдаун — даже если дальше упадём, API не разнесут
+        # Кулдаун сразу — даже при ошибке API не разнесут спамом
         gate.mark_used(user.id)
 
+        await ensure_user(db, user)
+        history = await db.get_history(user.id, limit=settings.history_limit)
+
         try:
-            await ensure_user(db, user)
-            history = await db.get_history(user.id, limit=settings.history_limit)
-
-            try:
-                await message.bot.send_chat_action(
-                    chat_id=message.chat.id,
-                    action=ChatAction.TYPING,
-                )
-            except TelegramAPIError:
-                # Блок / недоступный чат — всё равно пробуем ответить ниже
-                logger.info("Не удалось отправить typing user_id=%s", user.id)
-
-            reply = await llm.generate_reply(
-                history=history,
-                user_message=user_text,
+            await message.bot.send_chat_action(
+                chat_id=message.chat.id,
+                action=ChatAction.TYPING,
             )
+        except TelegramAPIError:
+            logger.info("Не удалось отправить typing user_id=%s", user.id)
 
-            await db.add_exchange(
-                user.id,
-                user_text,
-                reply,
-                keep=settings.history_limit,
-            )
+        reply = await llm.generate_reply(
+            history=history,
+            user_message=user_text,
+        )
 
-            for chunk in split_message(reply):
-                if not await safe_answer(message, chunk):
-                    break
+        await db.add_exchange(
+            user.id,
+            user_text,
+            reply,
+            keep=settings.history_limit,
+        )
 
-        except LLMError:
-            # Детали уже в логах LLMService; юзеру — по-человечески
-            logger.warning("Сбой генерации для user_id=%s", user.id)
-            await safe_answer(
-                message,
-                "Инет у меня моргнул / сервис подвис. Кинь ещё раз через минуту.",
-            )
-        except Exception:
-            logger.exception("Ошибка обработки сообщения user_id=%s", user.id)
-            await safe_answer(
-                message,
-                "Что-то у меня в голове щёлкнуло не так. "
-                "Попробуй ещё раз или /reset.",
-            )
+        for chunk in split_message(reply):
+            if not await safe_answer(message, chunk):
+                break
+
+    except LLMError:
+        logger.warning("Сбой генерации для user_id=%s", user.id)
+        await safe_answer(
+            message,
+            "Инет у меня моргнул / сервис подвис. Кинь ещё раз через минуту.",
+        )
+    except Exception:
+        logger.exception("Ошибка обработки сообщения user_id=%s", user.id)
+        await safe_answer(
+            message,
+            "Что-то у меня в голове щёлкнуло не так. "
+            "Попробуй ещё раз или /reset.",
+        )
+    finally:
+        gate.end(user.id)

@@ -80,7 +80,6 @@ async def run_bot() -> None:
     gate = UserGate(min_interval_sec=1.5)
 
     bot = Bot(token=settings.bot_token)
-    # MemoryStorage по умолчанию в Dispatcher — FSM нам не нужен, явно не тащим
     dispatcher = Dispatcher()
     dispatcher.include_router(setup_routers())
 

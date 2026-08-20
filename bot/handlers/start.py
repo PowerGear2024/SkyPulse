@@ -16,7 +16,7 @@ from aiogram.types import Message
 
 from bot.database import Database
 from bot.handlers.helpers import ensure_user, safe_answer
-from bot.persona import RESET_TEXT, START_TEXT
+from bot.persona import RESET_TEXT, get_start_text
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ async def cmd_start(message: Message, db: Database) -> None:
 
     try:
         await ensure_user(db, message.from_user)
-        await safe_answer(message, START_TEXT)
+        await safe_answer(message, get_start_text())
     except Exception:
         logger.exception("Ошибка в /start для user_id=%s", message.from_user.id)
         await safe_answer(

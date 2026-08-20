@@ -1,20 +1,17 @@
 """
-Ограничители: per-user lock и простой rate-limit.
+Ограничители: per-user слот обработки + rate-limit.
 
-Нужны, чтобы:
-  - параллельные сообщения одного юзера не перемешивали историю;
-  - спам не сжигал бюджет LLM;
-  - словарь локов не рос бесконечно.
+В asyncio один поток — set.add/check без await атомарны:
+гонка «проверил → await → занял» исключена без asyncio.Lock.
 """
 
 from __future__ import annotations
 
-import asyncio
 import time
 
 
 class UserGate:
-    """Пер-пользовательский замок + минимальный интервал между запросами."""
+    """Один активный запрос на пользователя + минимальный интервал."""
 
     def __init__(
         self,
@@ -23,21 +20,23 @@ class UserGate:
     ) -> None:
         self._min_interval = min_interval_sec
         self._idle_ttl = idle_ttl_sec
-        self._locks: dict[int, asyncio.Lock] = {}
+        self._inflight: set[int] = set()
         self._last_ts: dict[int, float] = {}
 
-    def lock_for(self, user_id: int) -> asyncio.Lock:
-        """Вернуть (или создать) lock для конкретного telegram_id."""
-        lock = self._locks.get(user_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[user_id] = lock
-        return lock
+    def try_begin(self, user_id: int) -> bool:
+        """
+        Занять слот обработки. False — уже обрабатываем этого юзера.
 
-    def is_busy(self, user_id: int) -> bool:
-        """True, если по этому юзеру уже идёт обработка."""
-        lock = self._locks.get(user_id)
-        return lock.locked() if lock is not None else False
+        Без очереди: второй апдейт сразу получает отказ, не ждёт lock.
+        """
+        if user_id in self._inflight:
+            return False
+        self._inflight.add(user_id)
+        return True
+
+    def end(self, user_id: int) -> None:
+        """Освободить слот (вызывать в finally)."""
+        self._inflight.discard(user_id)
 
     def seconds_until_allowed(self, user_id: int) -> float:
         """Сколько секунд ждать до следующего разрешённого запроса (0 = можно)."""
@@ -50,20 +49,16 @@ class UserGate:
     def mark_used(self, user_id: int) -> None:
         """Зафиксировать момент запроса (в т.ч. неудачного — против спама API)."""
         self._last_ts[user_id] = time.monotonic()
-        # Ленивая уборка: не на каждый вызов, а когда накопилось много ключей
         if len(self._last_ts) > 512:
-            self._prune_unlocked()
+            self._prune()
 
-    def _prune_unlocked(self) -> None:
-        """Удалить простаивающие записи без активного lock."""
+    def _prune(self) -> None:
+        """Удалить простаивающие timestamp'ы (слот inflight не трогаем)."""
         now = time.monotonic()
         stale = [
             uid
             for uid, ts in self._last_ts.items()
-            if now - ts > self._idle_ttl and not self.is_busy(uid)
+            if now - ts > self._idle_ttl and uid not in self._inflight
         ]
         for uid in stale:
             self._last_ts.pop(uid, None)
-            lock = self._locks.get(uid)
-            if lock is not None and not lock.locked():
-                self._locks.pop(uid, None)

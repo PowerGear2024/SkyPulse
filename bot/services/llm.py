@@ -14,7 +14,7 @@ from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
 from bot.config import Settings
-from bot.persona import SYSTEM_PROMPT
+from bot.persona import get_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ class LLMService:
                 model=self._settings.openai_model,
                 temperature=self._settings.llm_temperature,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": get_system_prompt()},
                     *messages,
                 ],
             )
@@ -129,7 +129,7 @@ class LLMService:
                 model=self._settings.anthropic_model,
                 max_tokens=4096,
                 temperature=self._settings.llm_temperature,
-                system=SYSTEM_PROMPT,
+                system=get_system_prompt(),
                 messages=messages,
             )
         except Exception as exc:

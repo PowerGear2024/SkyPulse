@@ -46,6 +46,8 @@ class Database:
 
     async def connect(self) -> None:
         """Открыть соединение и создать таблицы, если их ещё нет."""
+        if self._connection is not None:
+            return
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = await aiosqlite.connect(self._db_path)
         self._connection.row_factory = aiosqlite.Row
@@ -247,29 +249,6 @@ class Database:
             (telegram_id, telegram_id, keep),
         )
         return cursor.rowcount if cursor.rowcount is not None else 0
-
-    async def trim_history(self, telegram_id: int, keep: int) -> int:
-        """
-        Удалить старые сообщения, оставив только последние `keep`.
-
-        Сортировка по id (монотонный AUTOINCREMENT) надёжнее datetime
-        с секундной точностью при быстрых подряд записях.
-        """
-        try:
-            deleted = await self._trim_history_locked(telegram_id, keep)
-            await self.connection.commit()
-            if deleted:
-                logger.debug(
-                    "Обрезана история пользователя %s: удалено %s",
-                    telegram_id,
-                    deleted,
-                )
-            return deleted
-        except aiosqlite.Error:
-            logger.exception(
-                "Ошибка trim_history для telegram_id=%s", telegram_id
-            )
-            raise
 
     async def clear_history(self, telegram_id: int) -> None:
         """Полностью очистить историю диалога пользователя (/reset)."""
