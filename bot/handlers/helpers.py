@@ -19,6 +19,7 @@ MAX_USER_CHARS = 4000
 
 
 def as_telegram_user(sender: Any) -> User | None:
+    """Живой человек (не бот) — можно триггерить ответ."""
     if sender is None or not isinstance(sender, User):
         return None
     if getattr(sender, "bot", False) or getattr(sender, "deleted", False):
@@ -26,6 +27,26 @@ def as_telegram_user(sender: Any) -> User | None:
     if not getattr(sender, "id", None):
         return None
     return sender
+
+
+def memory_sender_info(sender: Any) -> tuple[int, str] | None:
+    """
+    Любой User (включая ботов) для записи в память чата.
+    Возвращает (sender_id, display_name) или None.
+    """
+    if sender is None or not isinstance(sender, User):
+        return None
+    if getattr(sender, "deleted", False):
+        return None
+    if not getattr(sender, "id", None):
+        return None
+    parts = [sender.first_name or "", sender.last_name or ""]
+    name = " ".join(p for p in parts if p).strip()
+    if not name:
+        name = sender.username or f"id{sender.id}"
+    if getattr(sender, "bot", False) and not name.endswith("bot"):
+        name = f"{name} (bot)"
+    return int(sender.id), name
 
 
 def display_name(user: User) -> str:

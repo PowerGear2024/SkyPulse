@@ -36,7 +36,7 @@ async def generate_and_send(
 ) -> bool:
     """
     Сгенерировать ответ по памяти чата (+ optional extra) и отправить.
-    Возвращает True, если хотя бы один кусок ушёл в чат.
+    Память is_me пишется только после успешной отправки.
     """
     blocked = guard.block_reason()
     if blocked:
@@ -47,8 +47,8 @@ async def generate_and_send(
         return False
 
     sent_any = False
+    delivered: list[str] = []
     try:
-        # Повторная проверка после ожидания слота
         blocked = guard.block_reason()
         if blocked:
             logger.debug("Пропуск ответа chat=%s: %s", chat_id, blocked)
@@ -56,8 +56,6 @@ async def generate_and_send(
 
         if gate.seconds_until_allowed(chat_id) > 0:
             return False
-
-        gate.mark_used(chat_id)
 
         history = await db.get_chat_history_for_llm(
             chat_id, limit=settings.history_limit
@@ -70,20 +68,10 @@ async def generate_and_send(
 
         reply = await generate_with_human_typing(client, chat_id, _produce)
 
-        # Владелец мог зайти, пока генерили
         blocked = guard.block_reason()
         if blocked:
             logger.info("Ответ отменён после генерации chat=%s: %s", chat_id, blocked)
             return False
-
-        await db.add_chat_message(
-            chat_id,
-            reply,
-            sender_id=my_id,
-            sender_name=None,
-            is_me=True,
-            keep=settings.history_limit,
-        )
 
         for i, chunk in enumerate(split_message(reply)):
             if i > 0:
@@ -95,9 +83,21 @@ async def generate_and_send(
                 guard=guard,
                 reply_to=reply_to if i == 0 else None,
             ):
+                delivered.append(chunk)
                 sent_any = True
             else:
                 break
+
+        if delivered:
+            gate.mark_used(chat_id)
+            await db.add_chat_message(
+                chat_id,
+                "\n".join(delivered),
+                sender_id=my_id,
+                sender_name=None,
+                is_me=True,
+                keep=settings.history_limit,
+            )
 
         return sent_any
 
@@ -150,13 +150,13 @@ async def send_prepared(
         return False
 
     sent_any = False
+    delivered: list[str] = []
     try:
         blocked = guard.block_reason()
         if blocked:
             return False
         if gate.seconds_until_allowed(chat_id) > 0:
             return False
-        gate.mark_used(chat_id)
 
         async def _produce() -> str:
             return text.strip()
@@ -168,15 +168,6 @@ async def send_prepared(
             logger.info("Proactive отменён chat=%s: %s", chat_id, blocked)
             return False
 
-        await db.add_chat_message(
-            chat_id,
-            reply,
-            sender_id=my_id,
-            sender_name=None,
-            is_me=True,
-            keep=settings.history_limit,
-        )
-
         for i, chunk in enumerate(split_message(reply)):
             if i > 0:
                 await human_pause_typing(client, chat_id, chunk)
@@ -187,9 +178,21 @@ async def send_prepared(
                 guard=guard,
                 reply_to=reply_to if i == 0 else None,
             ):
+                delivered.append(chunk)
                 sent_any = True
             else:
                 break
+
+        if delivered:
+            gate.mark_used(chat_id)
+            await db.add_chat_message(
+                chat_id,
+                "\n".join(delivered),
+                sender_id=my_id,
+                sender_name=None,
+                is_me=True,
+                keep=settings.history_limit,
+            )
         return sent_any
     except Exception:
         logger.exception("Ошибка send_prepared chat_id=%s", chat_id)

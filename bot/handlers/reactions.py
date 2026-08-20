@@ -52,6 +52,7 @@ def register_reaction_handlers(
         return
 
     seen: dict[tuple[int, int, int], float] = {}
+    inflight: set[tuple[int, int, int]] = set()
     my_id = int(me.id)
 
     @client.on(events.Raw)
@@ -71,6 +72,7 @@ def register_reaction_handlers(
                 me=me,
                 my_id=my_id,
                 seen=seen,
+                inflight=inflight,
             )
         except Exception:
             logger.exception("Ошибка обработки реакции")
@@ -88,6 +90,7 @@ async def _handle_reaction_update(
     me: User,
     my_id: int,
     seen: dict[tuple[int, int, int], float],
+    inflight: set[tuple[int, int, int]],
 ) -> None:
     peer = update.peer
     # ЛС / каналы-вещалки не трогаем
@@ -151,6 +154,8 @@ async def _handle_reaction_update(
     _prune_seen(seen, now)
     if key in seen and now - seen[key] < _DEDUP_TTL_SEC:
         return
+    if key in inflight:
+        return
 
     # Сообщение должно быть нашим
     try:
@@ -182,38 +187,48 @@ async def _handle_reaction_update(
     if not snippet:
         snippet = "(без текста)"
 
-    seen[key] = now
-
-    extra = [
-        {
-            "role": "user",
-            "content": (
-                f"[{name}]: *поставил(а) реакцию {emoji} "
-                f"на моё сообщение «{snippet}» — ответь коротко и по-человечески*"
-            ),
-        }
-    ]
-
-    logger.info(
-        "Реакция %s от %s на msg=%s в chat=%s",
-        emoji,
-        reactor_id,
-        msg_id,
-        chat_id,
+    reaction_line = (
+        f"*поставил(а) реакцию {emoji} на моё сообщение «{snippet}»*"
     )
 
-    await generate_and_send(
-        client,
-        db=db,
-        llm=llm,
-        settings=settings,
-        gate=gate,
-        guard=guard,
-        chat_id=chat_id,
-        my_id=my_id,
-        history_extra=extra,
-        reply_to=msg_id,
-    )
+    inflight.add(key)
+    try:
+        # Фиксируем факт реакции в памяти чата
+        try:
+            await db.add_chat_message(
+                chat_id,
+                reaction_line,
+                sender_id=reactor_id,
+                sender_name=name,
+                is_me=False,
+                keep=settings.history_limit,
+            )
+        except Exception:
+            logger.exception("Не удалось сохранить реакцию в память")
+
+        logger.info(
+            "Реакция %s от %s на msg=%s в chat=%s",
+            emoji,
+            reactor_id,
+            msg_id,
+            chat_id,
+        )
+
+        ok = await generate_and_send(
+            client,
+            db=db,
+            llm=llm,
+            settings=settings,
+            gate=gate,
+            guard=guard,
+            chat_id=chat_id,
+            my_id=my_id,
+            reply_to=msg_id,
+        )
+        if ok:
+            seen[key] = time.monotonic()
+    finally:
+        inflight.discard(key)
 
 
 def _peer_user_id(peer: Any) -> int | None:

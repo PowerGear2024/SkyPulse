@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 async def _login() -> None:
     try:
-        settings = load_settings()
+        settings = load_settings(require_llm=False)
     except ValueError as exc:
         logging.basicConfig(level=logging.ERROR)
         logging.error("Ошибка конфигурации: %s", exc)

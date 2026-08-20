@@ -1,13 +1,13 @@
 """
 Память группового чата + профили отправителей.
 
-Все текстовые сообщения группы пишутся в chat_messages,
-чтобы модель видела весь ход переписки, смысл и логику.
-ЛС не пишем сюда — они полностью игнорируются на уровне хендлера.
+Все текстовые сообщения группы пишутся в chat_messages.
+Один asyncio.Lock сериализует транзакции на общем aiosqlite-соединении.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -34,6 +34,7 @@ class Database:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._connection: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
 
     @property
     def connection(self) -> aiosqlite.Connection:
@@ -56,10 +57,11 @@ class Database:
         logger.info("SQLite подключена: %s", self._db_path)
 
     async def close(self) -> None:
-        if self._connection is not None:
-            await self._connection.close()
-            self._connection = None
-            logger.info("Соединение с SQLite закрыто")
+        async with self._lock:
+            if self._connection is not None:
+                await self._connection.close()
+                self._connection = None
+                logger.info("Соединение с SQLite закрыто")
 
     async def _create_tables(self) -> None:
         await self.connection.executescript(
@@ -73,7 +75,6 @@ class Database:
                 updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
-            -- Лента ВСЕХ сообщений группы (память чата)
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id     INTEGER NOT NULL,
@@ -91,7 +92,6 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_chat_messages_sender
                 ON chat_messages (chat_id, sender_id, id);
 
-            -- Проактивные посты (лимит в сутки)
             CREATE TABLE IF NOT EXISTS proactive_posts (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id         INTEGER NOT NULL,
@@ -119,38 +119,41 @@ class Database:
         first_name = _clip(first_name, _MAX_NAME_LEN)
         last_name = _clip(last_name, _MAX_NAME_LEN)
 
-        try:
-            await self.connection.execute("BEGIN")
-            cursor = await self.connection.execute(
-                """
-                INSERT INTO users (telegram_id, username, first_name, last_name)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(telegram_id) DO NOTHING
-                """,
-                (telegram_id, username, first_name, last_name),
-            )
-            is_new = cursor.rowcount == 1
-            if not is_new:
-                await self.connection.execute(
-                    """
-                    UPDATE users
-                    SET username   = ?,
-                        first_name = ?,
-                        last_name  = ?,
-                        updated_at = datetime('now')
-                    WHERE telegram_id = ?
-                    """,
-                    (username, first_name, last_name, telegram_id),
-                )
-            await self.connection.commit()
-            return is_new
-        except Exception:
+        async with self._lock:
             try:
-                await self.connection.rollback()
-            except aiosqlite.Error:
-                logger.exception("Не удалось откатить upsert_user")
-            logger.exception("Ошибка upsert_user для telegram_id=%s", telegram_id)
-            raise
+                await self.connection.execute("BEGIN IMMEDIATE")
+                cursor = await self.connection.execute(
+                    """
+                    INSERT INTO users (telegram_id, username, first_name, last_name)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(telegram_id) DO NOTHING
+                    """,
+                    (telegram_id, username, first_name, last_name),
+                )
+                is_new = cursor.rowcount == 1
+                if not is_new:
+                    await self.connection.execute(
+                        """
+                        UPDATE users
+                        SET username   = ?,
+                            first_name = ?,
+                            last_name  = ?,
+                            updated_at = datetime('now')
+                        WHERE telegram_id = ?
+                        """,
+                        (username, first_name, last_name, telegram_id),
+                    )
+                await self.connection.commit()
+                return is_new
+            except Exception:
+                try:
+                    await self.connection.rollback()
+                except aiosqlite.Error:
+                    logger.exception("Не удалось откатить upsert_user")
+                logger.exception(
+                    "Ошибка upsert_user для telegram_id=%s", telegram_id
+                )
+                raise
 
     async def add_chat_message(
         self,
@@ -170,86 +173,82 @@ class Database:
             raise ValueError("keep должен быть >= 2")
         sender_name = _clip(sender_name, _MAX_SENDER_NAME)
 
-        try:
-            await self.connection.execute("BEGIN")
-            await self.connection.execute(
-                """
-                INSERT INTO chat_messages
-                    (chat_id, sender_id, sender_name, is_me, content)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    chat_id,
-                    sender_id,
-                    sender_name,
-                    1 if is_me else 0,
-                    content,
-                ),
-            )
-            if keep is not None:
-                await self._trim_chat_locked(chat_id, keep)
-            await self.connection.commit()
-        except Exception:
+        async with self._lock:
             try:
-                await self.connection.rollback()
-            except aiosqlite.Error:
-                logger.exception("Не удалось откатить add_chat_message")
-            logger.exception(
-                "Ошибка add_chat_message chat_id=%s", chat_id
-            )
-            raise
+                await self.connection.execute("BEGIN IMMEDIATE")
+                await self.connection.execute(
+                    """
+                    INSERT INTO chat_messages
+                        (chat_id, sender_id, sender_name, is_me, content)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chat_id,
+                        sender_id,
+                        sender_name,
+                        1 if is_me else 0,
+                        content,
+                    ),
+                )
+                if keep is not None:
+                    await self._trim_chat_locked(chat_id, keep)
+                await self.connection.commit()
+            except Exception:
+                try:
+                    await self.connection.rollback()
+                except aiosqlite.Error:
+                    logger.exception("Не удалось откатить add_chat_message")
+                logger.exception(
+                    "Ошибка add_chat_message chat_id=%s", chat_id
+                )
+                raise
 
     async def get_chat_history_for_llm(
         self,
         chat_id: int,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """
-        Последние `limit` сообщений чата → формат Chat API.
-
-        Чужие: role=user, content='[Имя]: текст'
-        Мои:    role=assistant, content=текст
-        """
         if limit < 1:
             return []
-        try:
-            cursor = await self.connection.execute(
-                """
-                SELECT sender_name, is_me, content
-                FROM (
-                    SELECT sender_name, is_me, content, id
-                    FROM chat_messages
-                    WHERE chat_id = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                ) AS recent
-                ORDER BY id ASC
-                """,
-                (chat_id, limit),
-            )
-            rows = await cursor.fetchall()
-            result: list[dict[str, Any]] = []
-            for row in rows:
-                if row["is_me"]:
-                    result.append(
-                        {"role": "assistant", "content": row["content"]}
-                    )
-                else:
-                    name = (row["sender_name"] or "Кто-то").strip() or "Кто-то"
-                    result.append(
-                        {
-                            "role": "user",
-                            "content": f"[{name}]: {row['content']}",
-                        }
-                    )
-            return result
-        except aiosqlite.Error:
-            logger.exception(
-                "Ошибка get_chat_history_for_llm chat_id=%s", chat_id
-            )
-            raise
+        async with self._lock:
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT sender_name, is_me, content
+                    FROM (
+                        SELECT sender_name, is_me, content, id
+                        FROM chat_messages
+                        WHERE chat_id = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                    ) AS recent
+                    ORDER BY id ASC
+                    """,
+                    (chat_id, limit),
+                )
+                rows = await cursor.fetchall()
+            except aiosqlite.Error:
+                logger.exception(
+                    "Ошибка get_chat_history_for_llm chat_id=%s", chat_id
+                )
+                raise
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            if row["is_me"]:
+                result.append({"role": "assistant", "content": row["content"]})
+            else:
+                name = (row["sender_name"] or "Кто-то").strip() or "Кто-то"
+                result.append(
+                    {
+                        "role": "user",
+                        "content": f"[{name}]: {row['content']}",
+                    }
+                )
+        return result
 
     async def _trim_chat_locked(self, chat_id: int, keep: int) -> int:
+        """Вызывать только под self._lock внутри открытой транзакции."""
         cursor = await self.connection.execute(
             """
             DELETE FROM chat_messages
@@ -273,69 +272,117 @@ class Database:
         return cursor.rowcount if cursor.rowcount is not None else 0
 
     async def clear_chat_history(self, chat_id: int) -> None:
-        """Сброс памяти конкретного чата (/reset)."""
-        try:
-            await self.connection.execute(
-                "DELETE FROM chat_messages WHERE chat_id = ?",
-                (chat_id,),
-            )
-            await self.connection.commit()
-            logger.info("Память чата очищена chat_id=%s", chat_id)
-        except aiosqlite.Error:
-            logger.exception(
-                "Ошибка clear_chat_history chat_id=%s", chat_id
-            )
-            raise
+        async with self._lock:
+            try:
+                await self.connection.execute(
+                    "DELETE FROM chat_messages WHERE chat_id = ?",
+                    (chat_id,),
+                )
+                await self.connection.commit()
+                logger.info("Память чата очищена chat_id=%s", chat_id)
+            except aiosqlite.Error:
+                logger.exception(
+                    "Ошибка clear_chat_history chat_id=%s", chat_id
+                )
+                raise
 
-    async def count_proactive_today(self) -> int:
-        """Сколько проактивных постов за сегодня (UTC, datetime('now'))."""
-        try:
-            cursor = await self.connection.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM proactive_posts
-                WHERE date(created_at) = date('now')
-                """
-            )
-            row = await cursor.fetchone()
-            return int(row["c"]) if row else 0
-        except aiosqlite.Error:
-            logger.exception("Ошибка count_proactive_today")
-            raise
+    async def count_proactive_since(self, since_utc: str) -> int:
+        """Сколько проактивных постов с момента since_utc (UTC 'YYYY-MM-DD HH:MM:SS')."""
+        async with self._lock:
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM proactive_posts
+                    WHERE created_at >= ?
+                    """,
+                    (since_utc,),
+                )
+                row = await cursor.fetchone()
+                return int(row["c"]) if row else 0
+            except aiosqlite.Error:
+                logger.exception("Ошибка count_proactive_since")
+                raise
 
-    async def record_proactive(self, chat_id: int, target_user_id: int) -> None:
-        try:
-            await self.connection.execute(
-                """
-                INSERT INTO proactive_posts (chat_id, target_user_id)
-                VALUES (?, ?)
-                """,
-                (chat_id, target_user_id),
-            )
-            await self.connection.commit()
-        except aiosqlite.Error:
-            logger.exception(
-                "Ошибка record_proactive chat_id=%s user=%s",
-                chat_id,
-                target_user_id,
-            )
-            raise
+    async def try_reserve_proactive(
+        self,
+        chat_id: int,
+        target_user_id: int,
+        *,
+        max_per_day: int,
+        since_utc: str,
+    ) -> int | None:
+        """
+        Атомарно зарезервировать слот проактива.
+        Возвращает id строки или None, если лимит исчерпан.
+        """
+        if max_per_day <= 0:
+            return None
+        async with self._lock:
+            try:
+                await self.connection.execute("BEGIN IMMEDIATE")
+                cursor = await self.connection.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM proactive_posts
+                    WHERE created_at >= ?
+                    """,
+                    (since_utc,),
+                )
+                row = await cursor.fetchone()
+                used = int(row["c"]) if row else 0
+                if used >= max_per_day:
+                    await self.connection.rollback()
+                    return None
+                cursor = await self.connection.execute(
+                    """
+                    INSERT INTO proactive_posts (chat_id, target_user_id)
+                    VALUES (?, ?)
+                    """,
+                    (chat_id, target_user_id),
+                )
+                await self.connection.commit()
+                return int(cursor.lastrowid) if cursor.lastrowid else None
+            except Exception:
+                try:
+                    await self.connection.rollback()
+                except aiosqlite.Error:
+                    logger.exception("Не удалось откатить try_reserve_proactive")
+                logger.exception(
+                    "Ошибка try_reserve_proactive chat_id=%s", chat_id
+                )
+                raise
+
+    async def release_proactive(self, reservation_id: int) -> None:
+        """Откатить резерв, если отправка не удалась."""
+        async with self._lock:
+            try:
+                await self.connection.execute(
+                    "DELETE FROM proactive_posts WHERE id = ?",
+                    (reservation_id,),
+                )
+                await self.connection.commit()
+            except aiosqlite.Error:
+                logger.exception(
+                    "Ошибка release_proactive id=%s", reservation_id
+                )
+                raise
 
     async def list_active_chat_ids(self) -> list[int]:
-        """Чаты, где уже есть сообщения в памяти."""
-        try:
-            cursor = await self.connection.execute(
-                """
-                SELECT DISTINCT chat_id
-                FROM chat_messages
-                ORDER BY chat_id
-                """
-            )
-            rows = await cursor.fetchall()
-            return [int(r["chat_id"]) for r in rows]
-        except aiosqlite.Error:
-            logger.exception("Ошибка list_active_chat_ids")
-            raise
+        async with self._lock:
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT DISTINCT chat_id
+                    FROM chat_messages
+                    ORDER BY chat_id
+                    """
+                )
+                rows = await cursor.fetchall()
+                return [int(r["chat_id"]) for r in rows]
+            except aiosqlite.Error:
+                logger.exception("Ошибка list_active_chat_ids")
+                raise
 
     async def list_users_with_min_messages(
         self,
@@ -344,61 +391,76 @@ class Database:
         min_count: int = 10,
         exclude_sender_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Пользователи чата с ≥ min_count своих сообщений.
-        Возвращает [{sender_id, sender_name, msg_count}, ...]
-        """
         if min_count < 1:
             return []
-        try:
-            if exclude_sender_id is None:
-                cursor = await self.connection.execute(
-                    """
-                    SELECT sender_id,
-                           MAX(sender_name) AS sender_name,
-                           COUNT(*) AS msg_count
-                    FROM chat_messages
-                    WHERE chat_id = ?
-                      AND is_me = 0
-                      AND sender_id IS NOT NULL
-                    GROUP BY sender_id
-                    HAVING COUNT(*) >= ?
-                    ORDER BY msg_count DESC
-                    """,
-                    (chat_id, min_count),
+        async with self._lock:
+            try:
+                # Берём имя из самого свежего сообщения юзера (не MAX лексикографический)
+                if exclude_sender_id is None:
+                    cursor = await self.connection.execute(
+                        """
+                        SELECT m.sender_id,
+                               (
+                                   SELECT m2.sender_name
+                                   FROM chat_messages m2
+                                   WHERE m2.chat_id = m.chat_id
+                                     AND m2.sender_id = m.sender_id
+                                     AND m2.is_me = 0
+                                   ORDER BY m2.id DESC
+                                   LIMIT 1
+                               ) AS sender_name,
+                               COUNT(*) AS msg_count
+                        FROM chat_messages m
+                        WHERE m.chat_id = ?
+                          AND m.is_me = 0
+                          AND m.sender_id IS NOT NULL
+                        GROUP BY m.sender_id
+                        HAVING COUNT(*) >= ?
+                        ORDER BY msg_count DESC
+                        """,
+                        (chat_id, min_count),
+                    )
+                else:
+                    cursor = await self.connection.execute(
+                        """
+                        SELECT m.sender_id,
+                               (
+                                   SELECT m2.sender_name
+                                   FROM chat_messages m2
+                                   WHERE m2.chat_id = m.chat_id
+                                     AND m2.sender_id = m.sender_id
+                                     AND m2.is_me = 0
+                                   ORDER BY m2.id DESC
+                                   LIMIT 1
+                               ) AS sender_name,
+                               COUNT(*) AS msg_count
+                        FROM chat_messages m
+                        WHERE m.chat_id = ?
+                          AND m.is_me = 0
+                          AND m.sender_id IS NOT NULL
+                          AND m.sender_id != ?
+                        GROUP BY m.sender_id
+                        HAVING COUNT(*) >= ?
+                        ORDER BY msg_count DESC
+                        """,
+                        (chat_id, exclude_sender_id, min_count),
+                    )
+                rows = await cursor.fetchall()
+            except aiosqlite.Error:
+                logger.exception(
+                    "Ошибка list_users_with_min_messages chat_id=%s", chat_id
                 )
-            else:
-                cursor = await self.connection.execute(
-                    """
-                    SELECT sender_id,
-                           MAX(sender_name) AS sender_name,
-                           COUNT(*) AS msg_count
-                    FROM chat_messages
-                    WHERE chat_id = ?
-                      AND is_me = 0
-                      AND sender_id IS NOT NULL
-                      AND sender_id != ?
-                    GROUP BY sender_id
-                    HAVING COUNT(*) >= ?
-                    ORDER BY msg_count DESC
-                    """,
-                    (chat_id, exclude_sender_id, min_count),
-                )
-            rows = await cursor.fetchall()
-            return [
-                {
-                    "sender_id": int(r["sender_id"]),
-                    "sender_name": (r["sender_name"] or "Кто-то").strip()
-                    or "Кто-то",
-                    "msg_count": int(r["msg_count"]),
-                }
-                for r in rows
-            ]
-        except aiosqlite.Error:
-            logger.exception(
-                "Ошибка list_users_with_min_messages chat_id=%s", chat_id
-            )
-            raise
+                raise
+
+        return [
+            {
+                "sender_id": int(r["sender_id"]),
+                "sender_name": (r["sender_name"] or "Кто-то").strip()
+                or "Кто-то",
+                "msg_count": int(r["msg_count"]),
+            }
+            for r in rows
+        ]
 
     async def get_user_recent_texts(
         self,
@@ -406,32 +468,32 @@ class Database:
         sender_id: int,
         limit: int = 10,
     ) -> list[str]:
-        """Последние `limit` текстов конкретного пользователя (хронологически)."""
         if limit < 1:
             return []
-        try:
-            cursor = await self.connection.execute(
-                """
-                SELECT content
-                FROM (
-                    SELECT content, id
-                    FROM chat_messages
-                    WHERE chat_id = ?
-                      AND sender_id = ?
-                      AND is_me = 0
-                    ORDER BY id DESC
-                    LIMIT ?
-                ) AS recent
-                ORDER BY id ASC
-                """,
-                (chat_id, sender_id, limit),
-            )
-            rows = await cursor.fetchall()
-            return [str(r["content"]) for r in rows]
-        except aiosqlite.Error:
-            logger.exception(
-                "Ошибка get_user_recent_texts chat_id=%s sender=%s",
-                chat_id,
-                sender_id,
-            )
-            raise
+        async with self._lock:
+            try:
+                cursor = await self.connection.execute(
+                    """
+                    SELECT content
+                    FROM (
+                        SELECT content, id
+                        FROM chat_messages
+                        WHERE chat_id = ?
+                          AND sender_id = ?
+                          AND is_me = 0
+                        ORDER BY id DESC
+                        LIMIT ?
+                    ) AS recent
+                    ORDER BY id ASC
+                    """,
+                    (chat_id, sender_id, limit),
+                )
+                rows = await cursor.fetchall()
+                return [str(r["content"]) for r in rows]
+            except aiosqlite.Error:
+                logger.exception(
+                    "Ошибка get_user_recent_texts chat_id=%s sender=%s",
+                    chat_id,
+                    sender_id,
+                )
+                raise

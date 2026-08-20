@@ -107,7 +107,6 @@ async def run_userbot() -> None:
     except Exception:
         logger.exception("Критическая ошибка user-сессии")
         exit_code = 1
-        raise
     finally:
         logger.info("Остановка…")
         stop_event.set()

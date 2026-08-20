@@ -10,7 +10,7 @@
 pip install -r requirements.txt
 cp .env.example .env
 # TELEGRAM_API_ID / HASH с https://my.telegram.org/apps + ключ LLM
-# Рекомендуется ALLOWED_CHAT_IDS=-100...
+# Обязательно: ALLOWED_CHAT_IDS=-100...  (или ALLOW_ALL_CHATS=true)
 
 python -m bot.login
 python -m bot
@@ -21,10 +21,10 @@ python -m bot
 | | |
 |---|---|
 | ЛС | полный игнор |
-| Группы | читает все тексты в память |
+| Группы | читает все тексты в память (люди + боты) |
 | Ответ | по умолчанию только `@mention` / reply на твоё сообщение |
 | Реакции | ответ, если поставили реакцию на **твоё** сообщение |
-| Проактив | иногда коммент по теме 10 смс одного юзера, ≤5 раз/день |
+| Проактив | иногда коммент по теме 10 смс одного юзера, ≤5 раз/локальные сутки |
 | Часы | только `WORK_HOURS_START`–`WORK_HOURS_END` (`TIMEZONE`) |
 | Пауза | если ты сам пишешь с аккаунта — бот молчит до выхода из TG |
 | Печать | индикатор «печатает…» + задержка ~длина ответа |
@@ -33,6 +33,7 @@ python -m bot
 
 ### Ключевые переменные
 
+- `ALLOWED_CHAT_IDS` **или** `ALLOW_ALL_CHATS=true`
 - `GROUP_REPLY_MODE=mention` (или `all`)
 - `REPLY_ON_REACTIONS=true`
 - `PROACTIVE_ENABLED=true`, `PROACTIVE_MAX_PER_DAY=5`

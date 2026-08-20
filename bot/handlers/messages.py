@@ -1,8 +1,8 @@
 """
 Только ГРУППЫ / супергруппы. Личные сообщения — полный игнор.
 
-- Пишет в память все тексты чата (кроме служебных команд).
-- Отвечает по умолчанию только на @упоминание / reply на своё сообщение.
+- Пишет в память все тексты чата (кроме служебных команд), включая ботов.
+- Отвечает только живым людям (не ботам) по mention / all.
 - Молчит вне рабочих часов и пока владелец сам в Telegram.
 """
 
@@ -19,8 +19,8 @@ from bot.database import Database
 from bot.handlers.helpers import (
     MAX_USER_CHARS,
     as_telegram_user,
-    display_name,
     ensure_user_from_sender,
+    memory_sender_info,
     safe_reply,
 )
 from bot.persona import RESET_TEXT, get_start_text
@@ -65,35 +65,47 @@ def register_message_handlers(
         if not settings.is_chat_allowed(chat_id):
             return
 
-        sender = as_telegram_user(await event.get_sender())
-        if sender is None:
-            return
-
-        if int(sender.id) == int(me.id):
+        raw_sender = await event.get_sender()
+        if int(getattr(raw_sender, "id", 0) or 0) == int(me.id):
             return
 
         if len(text) > MAX_USER_CHARS:
             text = text[:MAX_USER_CHARS]
 
-        await ensure_user_from_sender(db, sender)
-        name = display_name(sender)
+        # Команды — только от живых людей, не в память
+        human = as_telegram_user(raw_sender)
+        if human is not None:
+            await ensure_user_from_sender(db, human)
 
         if _is_command(text, "start"):
-            if settings.is_user_allowed(int(sender.id)) and guard.can_act():
+            if (
+                human is not None
+                and settings.is_user_allowed(int(human.id))
+                and guard.can_act()
+            ):
                 await safe_reply(event, get_start_text(), guard=guard)
             return
         if _is_command(text, "reset"):
-            if settings.is_user_allowed(int(sender.id)) and guard.can_act():
+            if (
+                human is not None
+                and settings.is_user_allowed(int(human.id))
+                and guard.can_act()
+            ):
                 await _cmd_reset(event, db, chat_id, guard=guard)
             return
         if text.startswith("/"):
             return
 
+        # Память: люди + боты
+        mem = memory_sender_info(raw_sender)
+        if mem is None:
+            return
+        sender_id, name = mem
         try:
             await db.add_chat_message(
                 chat_id,
                 text,
-                sender_id=int(sender.id),
+                sender_id=sender_id,
                 sender_name=name,
                 is_me=False,
                 keep=settings.history_limit,
@@ -102,7 +114,10 @@ def register_message_handlers(
             logger.exception("Не удалось сохранить сообщение chat_id=%s", chat_id)
             return
 
-        if not settings.is_user_allowed(int(sender.id)):
+        # Ответ — только живым людям
+        if human is None:
+            return
+        if not settings.is_user_allowed(int(human.id)):
             return
 
         if settings.group_reply_mode == "mention":

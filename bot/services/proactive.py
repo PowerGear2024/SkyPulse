@@ -1,6 +1,6 @@
 """
 Проактив: иногда взять 10 смс одного юзера, по теме написать в чат.
-Не больше PROACTIVE_MAX_PER_DAY раз в сутки.
+Не больше PROACTIVE_MAX_PER_DAY раз в локальные сутки (TIMEZONE).
 """
 
 from __future__ import annotations
@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient
 from telethon.tl.types import User
@@ -24,6 +26,15 @@ logger = logging.getLogger(__name__)
 _ANALYZE_COUNT = 10
 
 
+def local_day_start_utc(timezone_name: str) -> str:
+    """Начало текущих локальных суток → UTC-строка для сравнения с datetime('now')."""
+    tz = ZoneInfo(timezone_name)
+    local_now = datetime.now(tz)
+    start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_local.astimezone(timezone.utc)
+    return start_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+
 async def proactive_loop(
     client: TelegramClient,
     *,
@@ -35,20 +46,19 @@ async def proactive_loop(
     me: User,
     stop_event: asyncio.Event,
 ) -> None:
-    """Фоновый цикл. Крутится, пока не set(stop_event)."""
     if not settings.proactive_enabled or settings.proactive_max_per_day <= 0:
         logger.info("Проактив выключен")
         return
 
     my_id = int(me.id)
     logger.info(
-        "Проактив: до %s/день, проверка ~каждые %ss, шанс %.0f%%",
+        "Проактив: до %s/день (%s), проверка ~каждые %ss, шанс %.0f%%",
         settings.proactive_max_per_day,
+        settings.timezone,
         settings.proactive_check_sec,
         settings.proactive_chance * 100,
     )
 
-    # Первая пауза — не стрелять сразу после старта
     first_delay = random.uniform(120.0, min(600.0, float(settings.proactive_check_sec)))
     try:
         await asyncio.wait_for(stop_event.wait(), timeout=first_delay)
@@ -70,7 +80,6 @@ async def proactive_loop(
         except Exception:
             logger.exception("Ошибка проактивного цикла")
 
-        # Джиттер, чтобы не было ровной сетки
         delay = settings.proactive_check_sec * random.uniform(0.7, 1.35)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=delay)
@@ -94,7 +103,8 @@ async def _maybe_proactive_once(
         logger.debug("Проактив: пауза (%s)", blocked)
         return
 
-    used = await db.count_proactive_today()
+    since_utc = local_day_start_utc(settings.timezone)
+    used = await db.count_proactive_since(since_utc)
     if used >= settings.proactive_max_per_day:
         logger.debug("Проактив: лимит дня исчерпан (%s)", used)
         return
@@ -115,11 +125,8 @@ async def _maybe_proactive_once(
             min_count=_ANALYZE_COUNT,
             exclude_sender_id=my_id,
         )
-        # Только разрешённые юзеры (если whitelist задан)
         users = [
-            u
-            for u in users
-            if settings.is_user_allowed(int(u["sender_id"]))
+            u for u in users if settings.is_user_allowed(int(u["sender_id"]))
         ]
         if not users:
             continue
@@ -133,6 +140,16 @@ async def _maybe_proactive_once(
         if len(texts) < _ANALYZE_COUNT:
             continue
 
+        reservation_id = await db.try_reserve_proactive(
+            chat_id,
+            sender_id,
+            max_per_day=settings.proactive_max_per_day,
+            since_utc=since_utc,
+        )
+        if reservation_id is None:
+            logger.debug("Проактив: слот не зарезервирован (лимит)")
+            return
+
         try:
             reply = await llm.generate_proactive(
                 user_name=name,
@@ -140,6 +157,7 @@ async def _maybe_proactive_once(
             )
         except LLMError:
             logger.warning("Проактив: LLM не дал текст chat=%s", chat_id)
+            await db.release_proactive(reservation_id)
             return
 
         ok = await send_prepared(
@@ -154,15 +172,14 @@ async def _maybe_proactive_once(
         )
         if not ok:
             logger.warning("Проактив: не отправилось chat=%s", chat_id)
+            await db.release_proactive(reservation_id)
             return
 
-        await db.record_proactive(chat_id, sender_id)
         logger.info(
-            "Проактив: пост про %s в chat=%s (%s/%s сегодня)",
+            "Проактив: пост про %s в chat=%s (резерв id=%s)",
             name,
             chat_id,
-            used + 1,
-            settings.proactive_max_per_day,
+            reservation_id,
         )
         return
 
